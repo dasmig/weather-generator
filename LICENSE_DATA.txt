@@ -1,0 +1,3 @@
+The data in the resources/ directory is a sample written for this library.
+List each source here with its licence before the first release (see
+doc/data.md).

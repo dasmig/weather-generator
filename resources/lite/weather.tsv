@@ -1,0 +1,8 @@
+# Sample catalogue written by tools/new-library.py. Replace it with the
+# library's data and describe the data in doc/data.md (rule 6).
+key	label	weight
+alpha	Alpha	5
+bravo	Bravo	3
+charlie	Charlie	1.5
+delta	Delta	0.5
+echo	Echo	0
