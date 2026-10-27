@@ -505,7 +505,7 @@ TEST_CASE("known answers for fixed seeds", "[kat]")
             h *= 0x100000001b3ULL;
         }
     }
-    REQUIRE(h == 0xbdf80ad7f66e9d04ULL);
+    REQUIRE(h == 0x5bf62d009a06bce5ULL);
 }
 
 // ---------------------------------------------------------------------------
@@ -661,5 +661,5 @@ TEST_CASE("weather batch: known answer of 10,000 items", "[batch][kat]")
     gen.for_each_weather(request, {.count = 10000, .threads = 4}, 1,
                          [&](std::uint64_t, const dasmig::weather& item)
                          { hash = dasmig::core::hash_combine(hash, dasmig::core::fnv1a64(item.to_json())); });
-    REQUIRE(hash == 0x0777d6b2fa239ba4ULL);
+    REQUIRE(hash == 0x4a6380cad2bcd9e0ULL);
 }
