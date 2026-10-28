@@ -13,28 +13,30 @@
 
 **[API Reference](https://dasmig.github.io/weather-generator/)** · **[Usage Guide](doc/usage.md)** · **[Data and Method](doc/data.md)** · **[Releases](https://github.com/dasmig/weather-generator/releases)**
 
-Daily weather for any place on land and any date: the low and the high, rain or snow and how much, thunder, cloud, humidity, wind, sunrise, sunset and hours of sunshine, drawn around the place's 1991-2020 climate normals so that thirty generated years look like thirty real ones.
+Daily weather for any place on land and any date: the low and the high, rain or snow and how much, snow on the ground, thunder, drizzle and fog, cloud, humidity, wind and gusts, sunrise, sunset, sunshine and solar radiation, drawn around the place's 1991-2020 climate normals so that thirty generated years look like thirty real ones, and nearby places share their weather as real neighbours do.
 
 ```
-2024-01-15: rain, 6.8 to 9.4 °C, 2.8 mm
-2024-01-16: light rain, 5.4 to 10.2 °C, 0.3 mm
-2024-01-17: light rain, 6.7 to 8.7 °C, 1.2 mm
-2024-01-18: mostly cloudy, 4.1 to 9.4 °C
+2024-01-15: light rain, 4.2 to 9.9 °C, 0.5 mm
+2024-01-16: sleet, 1.8 to 9.4 °C, 0.7 cm of snow
+2024-01-17: sleet, 2.3 to 5.2 °C, 0.3 cm of snow
+2024-01-18: mostly cloudy, -2.1 to 3.2 °C
 ```
 
 ## Features
 
 - **Any Place, Any Date**. Give a latitude and longitude (or leave them out for a place drawn by land area) and any date. The climate comes from the CRU TS 1991-2020 normals of the nearest cell: a 2-degree grid in `lite`, half a degree in `full`. A point off the coast takes the nearest land's weather up to 100 km out, and reports how far it is. An elevation moves temperatures by the standard lapse rate, and `warming` shifts them for a warmer climate than the normals'.
 
-- **Weather That Behaves Like Weather**. Wet days cluster, warm spells last, and some months run wet or cold: a Richardson-type weather generator (a rain Markov chain, gamma-distributed amounts, autocorrelated daily mean and range, month-to-month anomalies), fitted on 162 GHCN-Daily stations and checked against 120 others it never saw. Monthly means, wet days, wet-day amounts, day-to-day spread and year-to-year spread land within a few percent of those stations (see [Data and Method](doc/data.md)).
+- **Weather That Behaves Like Weather**. Wet days cluster, dry spells run long, warm spells last, fronts bring warm days before the rain and cold days after it, and some months run wet or cold: a Richardson-type weather generator (a semi-Markov rain chain, Weibull amounts, autocorrelated daily mean and range shifted by the rain around each day, month-to-month anomalies), fitted on 162 GHCN-Daily stations and checked against 119 others it never saw. Monthly means, wet days, wet-day amounts, the wettest days, dry spells, day-to-day spread and year-to-year spread land within a few percent of those stations (see [Data and Method](doc/data.md)).
 
 - **Series That Agree**. A day's weather depends only on the seed, the place and the date, so the weather of 10 March is the same whether it is asked for alone or inside a series that starts in January, and overlapping series agree.
 
-- **Rain, Snow, Sleet and Thunder**. The form of precipitation follows the day's temperature, and thunder its heat and rain, both fitted on station records. Twelve conditions from `clear` to `heavy_snow` and `thunderstorm`, and frost on days below 0 °C.
+- **One World per Seed**. On the same seed, nearby places share their weather: a rainy day in Paris is likely rainy in London, a cold month cold across the region, with correlations that fall with distance as between real weather stations. Turn `spatial` off for each place's own weather.
 
-- **The Sun**. Sunrise, sunset and day length from NOAA's solar equations, polar day and night included, and the hours of sunshine the day's cloud lets through.
+- **Rain, Snow, Sleet, Thunder, Drizzle and Fog**. The form of precipitation follows the day's temperature, thunder and drizzle its heat and rain, fog its humidity, rain, wind and season, and the day's strongest gust its wind, all fitted on station records. Snow lies on the ground, melts in a thaw and settles as it ages. Fourteen conditions from `clear` and `fog` to `heavy_snow` and `thunderstorm`, and frost on days below 0 °C.
 
-- **Hours, Imperial Units and Real Years**. Ask for a day's 24 hours (a temperature curve from sunrise to the next night, rain in spells that add up to the day, cloud, wind, humidity and sunshine); for °F, inches and mph; or for any month of 1991-2020 as it really was (a cold winter cold, a drought summer dry), from CRU TS monthly records. All three are opt-in: a plain request gives the same days as before.
+- **The Sun**. Sunrise, sunset and day length from NOAA's solar equations, polar day and night included, the hours of sunshine the day's cloud lets through (fitted on CRU sunshine records), and the solar energy reaching the ground.
+
+- **Hours, Imperial Units and Real Years**. Ask for a day's 24 hours (a temperature curve from sunrise to the next night, rain in spells that add up to the day, cloud, wind, humidity and sunshine); for °F, inches and mph; or for any month of 1991-2020 as it really was (a cold winter cold, a drought summer dry), from CRU TS monthly records. All three are opt-in: a plain request gives the same days without them.
 
 - **Climate Normals Too**. `climate_at(lat, lon)` returns the monthly normals a place's weather is drawn around: temperature, diurnal range, precipitation, wet days, humidity, cloud and wind.
 
@@ -78,7 +80,7 @@ paris.longitude = 2.35;
 paris.date = 2024y / 1 / 15;
 
 auto day = gen.get_weather(paris, 7); // seed 7
-std::cout << day << '\n';             // 2024-01-15: rain, 6.8 to 9.4 °C, 2.8 mm
+std::cout << day << '\n';             // 2024-01-15: light rain, 4.2 to 9.9 °C, 0.5 mm
 std::cout << day.to_json() << '\n';   // every field, with the seed
 
 for (const auto& d : gen.get_weather_series(paris, 7, 42)) // a week, seed 42
