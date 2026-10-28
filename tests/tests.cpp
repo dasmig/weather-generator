@@ -1,6 +1,8 @@
 #include "catch_amalgamated.hpp"
 #include "../dasmig/weathergen.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -659,6 +661,281 @@ TEST_CASE("known answers for fixed seeds", "[kat]")
         }
     }
     REQUIRE(h == 0xf799f8c25c34c3dfULL);
+}
+
+// ---------------------------------------------------------------------------
+// Units, hours and historical months (1.1.0)
+// ---------------------------------------------------------------------------
+
+static std::filesystem::path history_file()
+{
+    for (const auto* candidate : {"resources/history/history.tsv", "../resources/history/history.tsv"})
+    {
+        if (std::filesystem::is_regular_file(candidate)) return candidate;
+    }
+    return {};
+}
+
+static std::uint64_t json_hash(std::uint64_t h, const std::string& json)
+{
+    for (const char c : json)
+    {
+        h ^= static_cast<unsigned char>(c);
+        h *= 0x100000001b3ULL;
+    }
+    return h;
+}
+
+TEST_CASE("imperial units convert the same day", "[units]")
+{
+    const auto gen = make_loaded_generator();
+    for (std::uint64_t s = 0; s < 400; ++s)
+    {
+        auto r = dasmig::weather_request{};
+        r.date = std::chrono::year_month_day{std::chrono::sys_days{2023y / 1 / 1} + std::chrono::days{s % 365}};
+        const auto m = gen.get_weather(r, s);
+        r.units = dasmig::unit_system::imperial;
+        const auto i = gen.get_weather(r, s);
+        REQUIRE(m.units == dasmig::unit_system::metric);
+        REQUIRE(i.units == dasmig::unit_system::imperial);
+        // Converted before rounding, so within the two roundings.
+        REQUIRE(i.tmin == Catch::Approx((m.tmin * 1.8) + 32.0).margin(0.15));
+        REQUIRE(i.tmean == Catch::Approx((m.tmean * 1.8) + 32.0).margin(0.15));
+        REQUIRE(i.tmax == Catch::Approx((m.tmax * 1.8) + 32.0).margin(0.15));
+        REQUIRE(i.precipitation == Catch::Approx(m.precipitation / 25.4).margin(0.007));
+        REQUIRE(i.snowfall == Catch::Approx(m.snowfall / 2.54).margin(0.07));
+        REQUIRE(i.wind == Catch::Approx(m.wind / 0.44704).margin(0.17));
+        // Everything else is the same day.
+        REQUIRE(i.frost == m.frost);
+        REQUIRE(i.condition == m.condition);
+        REQUIRE(i.type == m.type);
+        REQUIRE(i.cloud_cover == m.cloud_cover);
+        REQUIRE(i.humidity == m.humidity);
+        REQUIRE(i.sunshine_hours == m.sunshine_hours);
+        REQUIRE(i.elevation == m.elevation);
+        REQUIRE(i.sunrise == m.sunrise);
+    }
+    const auto paris = at(48.85, 2.35, 2024y / 1 / 15);
+    auto imperial = paris;
+    imperial.units = dasmig::unit_system::imperial;
+    // Metric JSON has no units key (it is 1.0's); imperial says so.
+    REQUIRE(gen.get_weather(paris, 3).to_json().find("\"units\"") == std::string::npos);
+    REQUIRE(gen.get_weather(imperial, 3).to_json().starts_with(R"({"date":"2024-01-15","units":"imperial","place":)"));
+    REQUIRE(gen.get_weather(imperial, 3).to_string().find("°F") != std::string::npos);
+    REQUIRE(dasmig::to_string(dasmig::unit_system::imperial) == "imperial");
+    imperial.units = static_cast<dasmig::unit_system>(7);
+    REQUIRE_THROWS_AS(gen.get_weather(imperial, 3), std::invalid_argument);
+}
+
+TEST_CASE("hours belong to their day and add up to it", "[hours]")
+{
+    const auto gen = make_loaded_generator();
+    for (const auto& [lat, lon] :
+         std::vector<std::pair<double, double>>{{48.85, 2.35}, {-33.9, 151.2}, {55.75, 37.6}, {1.3, 103.8}, {40.0, -105.0}})
+    {
+        auto r = at(lat, lon, 2023y / 11 / 20);
+        const auto days = gen.get_weather_series(r, 60, 21);
+        r.hourly = true;
+        const auto hourly = gen.get_weather_series(r, 60, 21);
+        REQUIRE(hourly.size() == days.size());
+        for (std::size_t k = 0; k < days.size(); ++k)
+        {
+            const auto& d = hourly[k];
+            REQUIRE(days[k].hours.empty());
+            // The day itself does not change.
+            auto copy = d;
+            copy.hours.clear();
+            REQUIRE(copy.to_json() == days[k].to_json());
+            REQUIRE(d.hours.size() == 24);
+            long long water = 0;
+            long long snow = 0;
+            double daylight = 0.0;
+            double sunshine = 0.0;
+            double wind = 0.0;
+            // The night before runs from the day before's high, the evening
+            // towards the next day's low, which can lie outside the day's
+            // range (the series' ends have neighbours outside it).
+            const bool inner = k > 0 && k + 1 < days.size();
+            const double low = inner ? std::min({d.tmin, days[k + 1].tmin, days[k - 1].tmax}) - 0.05 : -1000.0;
+            const double high = inner ? std::max({d.tmax, days[k - 1].tmax, days[k + 1].tmin}) + 0.05 : 1000.0;
+            for (int h = 0; h < 24; ++h)
+            {
+                const auto& o = d.hours[static_cast<std::size_t>(h)];
+                REQUIRE(o.hour == h);
+                REQUIRE(o.time == d.hours.front().time + std::chrono::hours{h});
+                water += std::llround(o.precipitation * 10.0);
+                snow += std::llround(o.snowfall * 10.0);
+                daylight += o.daylight_hours;
+                sunshine += o.sunshine_hours;
+                wind += o.wind;
+                REQUIRE(o.temperature >= low);
+                REQUIRE(o.temperature <= high);
+                REQUIRE(o.sunshine_hours <= o.daylight_hours + 0.005);
+                REQUIRE((o.cloud_cover >= 0.0 && o.cloud_cover <= 1.0));
+                REQUIRE((o.humidity >= 5.0 && o.humidity <= 100.0));
+                if (o.precipitation > 0.0) REQUIRE(o.type == d.type);
+                else REQUIRE(o.type == dasmig::precipitation_type::none);
+                if (o.thunder) REQUIRE(o.condition == dasmig::weather_condition::thunderstorm);
+            }
+            REQUIRE(water == std::llround(d.precipitation * 10.0));
+            REQUIRE(snow == std::llround(d.snowfall * 10.0));
+            REQUIRE(daylight == Catch::Approx(d.daylight_hours).margin(0.13));
+            REQUIRE(sunshine == Catch::Approx(d.sunshine_hours).margin(0.2));
+            REQUIRE(wind / 24.0 == Catch::Approx(d.wind).margin(0.1));
+            // Hour 0 starts at local mean midnight.
+            const auto midnight = std::chrono::sys_time<std::chrono::minutes>{std::chrono::sys_days{d.date}} -
+                                  std::chrono::minutes{std::llround(4.0 * lon)};
+            REQUIRE(d.hours.front().time == midnight);
+            // Midnight is continuous: the next day starts near where this one ends.
+            if (k + 1 < days.size())
+            {
+                REQUIRE(std::abs(hourly[k + 1].hours.front().temperature - d.hours.back().temperature) < 3.0);
+            }
+        }
+        // A day's hours do not depend on where its series starts.
+        auto one = r;
+        one.date = hourly[17].date;
+        REQUIRE(gen.get_weather(one, 21).to_json() == hourly[17].to_json());
+    }
+}
+
+TEST_CASE("hours: the warmest hours follow the sun, polar days have hours too", "[hours]")
+{
+    const auto gen = make_loaded_generator();
+    // Over many days, the coolest hour is near sunrise and the warmest in
+    // the afternoon of local mean time, east or west.
+    for (const double lon : {-120.0, 0.0, 115.0})
+    {
+        std::array<double, 24> mean{};
+        for (std::uint64_t s = 0; s < 200; ++s)
+        {
+            auto r = at(35.0, lon, 2023y / 4 / 15);
+            r.hourly = true;
+            const auto w = gen.get_weather(r, s);
+            for (std::size_t h = 0; h < 24; ++h) mean.at(h) += w.hours[h].temperature / 200.0;
+        }
+        const auto warmest = std::distance(mean.begin(), std::ranges::max_element(mean));
+        const auto coolest = std::distance(mean.begin(), std::ranges::min_element(mean));
+        REQUIRE((warmest >= 13 && warmest <= 16));
+        REQUIRE((coolest >= 4 && coolest <= 6));
+    }
+    for (const auto date : {2023y / 6 / 21, 2023y / 12 / 21})
+    {
+        auto r = at(78.2, 15.6, date); // Svalbard: polar day, then polar night
+        r.hourly = true;
+        const auto w = gen.get_weather(r, 3);
+        REQUIRE(w.hours.size() == 24);
+        double daylight = 0.0;
+        for (const auto& h : w.hours) daylight += h.daylight_hours;
+        REQUIRE(daylight == (date == 2023y / 6 / 21 ? 24.0 : 0.0));
+    }
+}
+
+TEST_CASE("historical months need the history and its years", "[history][errors]")
+{
+    auto gen = make_loaded_generator();
+    auto r = at(48.85, 2.35, 2010y / 1 / 15);
+    r.historical = true;
+    REQUIRE_FALSE(gen.has_history());
+    REQUIRE_THROWS_AS(gen.get_weather(r, 1), std::runtime_error);
+    REQUIRE_FALSE(history_file().empty());
+    gen.load_history(history_file());
+    REQUIRE(gen.has_history());
+    REQUIRE_NOTHROW(gen.get_weather(r, 1));
+    r.date = 1990y / 12 / 31;
+    REQUIRE_THROWS_AS(gen.get_weather(r, 1), std::invalid_argument);
+    r.date = 2020y / 12 / 31;
+    REQUIRE_NOTHROW(gen.get_weather(r, 1));
+    REQUIRE_THROWS_AS(gen.get_weather_series(r, 2, 1), std::invalid_argument); // runs into 2021
+    REQUIRE_THROWS_AS(gen.load_history(std::filesystem::path{"no/such/history.tsv"}), dasmig::core::tsv_error);
+    REQUIRE_THROWS_AS(gen.load_history(std::filesystem::path{lite_dir() / "climate.tsv"}), dasmig::core::tsv_error);
+    REQUIRE(gen.has_history()); // a failed load keeps the months
+}
+
+TEST_CASE("historical months follow the months as they were", "[history][stats]")
+{
+    auto gen = make_loaded_generator();
+    gen.load_history(history_file());
+    // The anomalies of the block from the file itself.
+    const auto doc = dasmig::core::tsv_document::load(history_file());
+    const auto months_of = [&](const std::string& key, std::string_view column)
+    {
+        for (const auto& row : doc.rows())
+        {
+            if (row.get<std::string>("key") != key) continue;
+            std::vector<double> out;
+            for (const auto item : row.list(column)) out.push_back(std::stod(std::string{item}));
+            return out;
+        }
+        FAIL("no block " << key);
+        return std::vector<double>{};
+    };
+    // Paris in January 2010 (a cold winter in Europe) and a wet and a dry
+    // month there, over many seeds.
+    const auto tmean = months_of("49.00,3.00", "tmean");
+    const auto precipitation = months_of("49.00,3.00", "precipitation");
+    const auto month_index = [](int year, int month) { return static_cast<std::size_t>(((year - 1991) * 12) + month - 1); };
+    REQUIRE(tmean[month_index(2010, 1)] < -1.0);
+
+    const auto mean_of = [&](int year, unsigned month, bool historical)
+    {
+        double t = 0.0;
+        double p = 0.0;
+        constexpr int seeds = 60;
+        for (std::uint64_t s = 0; s < seeds; ++s)
+        {
+            auto r = at(48.85, 2.35, std::chrono::year{year} / std::chrono::month{month} / 1);
+            r.historical = historical;
+            const auto days = gen.get_weather_series(r, 28, s);
+            for (const auto& d : days)
+            {
+                t += d.tmean / (28.0 * seeds);
+                p += d.precipitation / seeds;
+            }
+        }
+        return std::pair{t, p};
+    };
+    for (const auto [year, month] : std::vector<std::pair<int, unsigned>>{{2010, 1}, {2003, 8}, {2016, 6}, {1996, 3}})
+    {
+        INFO(year << "-" << month);
+        const auto [t_normal, p_normal] = mean_of(year, month, false);
+        const auto [t_history, p_history] = mean_of(year, month, true);
+        const auto k = month_index(year, static_cast<int>(month));
+        REQUIRE(t_history - t_normal == Catch::Approx(tmean[k]).margin(0.6));
+        REQUIRE(p_history / p_normal == Catch::Approx(precipitation[k] / 100.0).epsilon(0.25));
+    }
+    // The signature carries the history's data too.
+    auto r = at(48.85, 2.35, 2010y / 1 / 15);
+    REQUIRE(gen.get_weather(r, 1).signature().data == gen.data_hash());
+    r.historical = true;
+    REQUIRE(gen.get_weather(r, 1).signature().data != gen.data_hash());
+    // A historical day does not depend on where its series starts either.
+    const auto series = gen.get_weather_series(r, 90, 4);
+    auto later = r;
+    later.date = series[61].date;
+    REQUIRE(gen.get_weather(later, 4).to_json() == series[61].to_json());
+}
+
+TEST_CASE("known answers for units, hours and historical months", "[kat]")
+{
+    auto gen = make_loaded_generator();
+    gen.load_history(history_file());
+    std::uint64_t h = 0xcbf29ce484222325ULL;
+    auto r = at(48.85, 2.35, 2010y / 1 / 1);
+    r.units = dasmig::unit_system::imperial;
+    for (const auto& w : gen.get_weather_series(r, 365, 11)) h = json_hash(h, w.to_json());
+    r.units = dasmig::unit_system::metric;
+    r.hourly = true;
+    for (const auto& w : gen.get_weather_series(r, 60, 12)) h = json_hash(h, w.to_json());
+    r.hourly = false;
+    r.historical = true;
+    for (const auto& w : gen.get_weather_series(r, 365, 13)) h = json_hash(h, w.to_json());
+    r = at(-33.9, 151.2, 1998y / 6 / 1);
+    r.historical = true;
+    r.hourly = true;
+    r.units = dasmig::unit_system::imperial;
+    for (const auto& w : gen.get_weather_series(r, 30, 14)) h = json_hash(h, w.to_json());
+    REQUIRE(h == 0x6fbdd2bfede1c49dULL);
 }
 
 // ---------------------------------------------------------------------------

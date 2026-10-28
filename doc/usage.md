@@ -12,6 +12,9 @@ weather-generator draws daily weather for a place on land and a date: the low an
 <li><a href="#the-request">The Request</a></li>
 <li><a href="#the-result">The Result</a></li>
 <li><a href="#series">Series</a></li>
+<li><a href="#imperial-units">Imperial Units</a></li>
+<li><a href="#hours">Hours</a></li>
+<li><a href="#historical-months">Historical Months</a></li>
 <li><a href="#climate-normals">Climate Normals</a></li>
 <li><a href="#what-is-not-modelled">What Is Not Modelled</a></li>
 <li><a href="#seeding-and-deterministic-generation">Seeding and Deterministic Generation</a></li>
@@ -81,6 +84,9 @@ Both cover every land cell of CRU TS except Antarctica, and share `land.tsv`, th
 | `elevation` | the cell's mean elevation | metres, -500 to 9000; temperatures move 6.5 °C per km from the cell's elevation |
 | `date` | 2023-07-01 | any valid date; the first day of a series |
 | `warming` | 0 | °C added to every temperature, -10 to 10 |
+| `units` | `unit_system::metric` | `metric` or `imperial` (°F, inches, mph); see [Imperial Units](#imperial-units) |
+| `hourly` | `false` | also give each day's 24 hours; see [Hours](#hours) |
+| `historical` | `false` | draw each month around the month as it was, 1991-2020; see [Historical Months](#historical-months) |
 
 A point uses the nearest climate cell (by distance on the sphere; ties go to the earlier row). The point's own latitude, longitude and elevation are returned; the climate is the cell's. Without a point, a cell is drawn with probability proportional to its land area, and the result carries the cell's point.
 
@@ -118,6 +124,8 @@ The library never reads the clock. A request is used for one call only, so nothi
 | `sunshine_hours` | the daylight not covered by cloud, hours, to 0.1 |
 | `sunrise`, `sunset` | `std::optional<std::chrono::sys_time<std::chrono::minutes>>`, UTC to the minute; empty in polar day and night. `weather::time_string(t)` gives `YYYY-MM-DDTHH:MMZ` |
 | `condition` | the day in a word, below |
+| `units` | `unit_system::metric` or `imperial`, as requested |
+| `hours` | the 24 hours when the request set `hourly`, empty otherwise |
 
 Sunrise and sunset come from NOAA's solar calculator equations at the point, for the sun's upper edge at the horizon with standard refraction (the tests check them against a plain double-precision implementation of the same equations, to half a minute). They are in UTC, so in the far east or west a sunrise can fall on the day before (Sydney's 1 January sunrise is at 18:48 UTC on 31 December). The library has no time zones: add the place's offset for local time.
 
@@ -153,6 +161,64 @@ So a game can ask for today alone each day and still get weather that runs on fr
 
 Each call reads 48 days before its first day, so one day alone costs about as much as ten days of a series: a single day takes about 15 µs, a year as one series about 0.5 ms (see `make bench`).
 
+## Imperial Units
+
+`units = dasmig::unit_system::imperial` gives the weather values in °F, inches and mph: `tmin`, `tmean` and `tmax` to 0.1 °F, `precipitation` to 0.01 in, `snowfall` to 0.1 in (10 in of snow per inch of water) and `wind` to 0.1 mph. The values are converted before rounding, so they are the metric day's, not its rounded numbers converted again. Everything else is the same day: `frost` is still a `tmin` below 32 °F, the condition thresholds are the metric ones, and the place keeps `elevation` in metres and `distance_km` in km. The request's `elevation` and `warming` are always metres and °C.
+
+```cpp
+paris.units = dasmig::unit_system::imperial;
+gen.get_weather(paris, 3); // 2024-01-15: light rain, 34.2 to 43.7 °F, 0.05 in
+```
+
+The JSON of an imperial day has `"units":"imperial"` after the date. A metric day has no `units` key, so metric JSON is exactly 1.0's.
+
+## Hours
+
+`hourly = true` adds each day's 24 hours to `weather::hours`. The day itself does not change: a day with hours is the day without them plus the hours, and a day's hours, like the day, do not depend on where its series starts. They come from a stream of their own.
+
+| Field | Meaning |
+| --- | --- |
+| `hour`, `time` | the hour of the place's mean solar day, 0 to 23, and its start in UTC |
+| `temperature` | at the start of the hour, °C (°F), to 0.1 |
+| `precipitation`, `snowfall`, `type`, `thunder` | in the hour; dry hours have type `none` |
+| `cloud_cover`, `humidity`, `wind` | in the hour |
+| `daylight_hours`, `sunshine_hours` | the part of the hour the sun is up, and the bright sunshine in it, 0 to 1, to 0.01 |
+| `condition` | the hour in a word: the day's cloud thresholds, and per hour light rain below 0.5 mm, rain below 4 mm, heavy rain from 4 mm (snow below 0.5 mm of water, below 2 mm, and more) |
+
+The hours are those of local mean solar time: hour 0 starts at the place's mean midnight, `4 * longitude` minutes before 00:00 UTC, so the coolest hour is near sunrise and the warmest in the afternoon at any longitude. Add the place's time zone yourself for clock time; it differs from mean solar time by up to an hour or two, and by daylight saving.
+
+- **Temperature** rises as a sine from `tmin` at sunrise to `tmax` at the warmest hour (four hours before sunset, or midway through a short day), falls to the sunset temperature, then falls as a square root to the next day's `tmin` at the next sunrise (Cesaraccio et al. 2001). The hours before sunrise finish the previous night, so one day runs into the next with no jump at midnight. In polar day and night there is no sunrise: the hours follow a plain daily wave between `tmin` and `tmax`, coolest at 03:00.
+- **Precipitation** falls in one spell of wet hours or (30% of days) two. The number of wet hours rises with the day's amount (2 + 2.5 ln(1 + mm) on average, half that on thunder days, which are one spell centred on mid-afternoon). In metric units the hours add up to the day's precipitation and snowfall exactly.
+- **Cloud and wind** wander around the day's values from hour to hour. Wet hours are cloudy. The wind blows strongest in the early afternoon, and the hours average to the day's wind. Sunshine is the day's sunshine shared out by each hour's daylight and clear sky.
+- **Humidity** keeps the day's vapour pressure, so it is highest in the cool of the night and lowest in the afternoon, and at least 90% while it rains.
+
+```cpp
+paris.hourly = true;
+for (const auto& h : gen.get_weather(paris, 3).hours)
+{
+    std::cout << h.hour << ": " << h.temperature << " °C, " << h.precipitation << " mm\n";
+}
+```
+
+The JSON of a day with hours has an `hours` array after `sunset`. A long hourly series is large: a year is 8,760 hours.
+
+## Historical Months
+
+`historical = true` draws each month around the month as it really was, from January 1991 to December 2020, instead of around the 1991-2020 normals. A cold winter is cold, a drought summer dry and a wet spring wet, while the days within each month are still drawn: the seed decides the weather of each day, and history decides the month's character.
+
+```cpp
+gen.load_history();             // once: resources/history/history.tsv (about 20 MB)
+dasmig::weather_request r{.latitude = 48.85, .longitude = 2.35, .date = 2010y / 1 / 1};
+r.historical = true;            // Paris in January 2010, about 3 °C colder than the normal
+auto month = gen.get_weather_series(r, 31, 7);
+```
+
+- **Data.** `history.tsv` holds, for each 2-degree block of land, each month's temperature anomaly (°C), its precipitation as a percentage of the normal and its wet-day anomaly (days), against the 1991-2020 normals of CRU TS 4.10. A cell takes the anomalies of the block its point lies in, so a `full`-tier cell gets the block's anomaly on its own normals. `load()` does not read it and it is not compiled in; call `load_history()` (or `load_history(path)`) before the first historical request.
+- **Method.** The month's temperature anomaly moves the daily mean, and the precipitation and wet days set the odds of a wet day and the amount on a wet day, all interpolated between mid-months as the normals are. The random month anomalies of a normal request are left out, since the real month carries them. Within a month, days vary as on any other day.
+- **Range.** Every day asked for must fall in 1991-2020, or the call throws `std::invalid_argument`; without the history loaded it throws `std::runtime_error`. The 48 days read before the first day may fall before 1991 and use the normals.
+- **Replay.** The signature's `data` combines the climate's hash with the history's, so a historical result replays only against the same history.
+- **Not modelled.** The diurnal range, cloud, humidity and wind of a historical month are the normals'; where CRU TS had no stations within reach, its month is close to the normal.
+
 ## Climate Normals
 
 `climate_at(latitude, longitude)` returns the normals of the cell a point uses, the means its weather is drawn around:
@@ -171,12 +237,11 @@ Each element has twelve values, January to December: `tmean` (°C), `dtr` (diurn
 
 ## What Is Not Modelled
 
-- **One day, one value.** Each day has a low, a high, a total and means; there are no hourly temperatures and no rain timing.
+- **Hours are shaped, not simulated.** Hourly temperatures follow a fixed daily curve between the days' lows and highs, and rain timing is drawn per day; there are no fronts passing at a given hour.
 - **No snowpack.** `snowfall` is the day's fresh snow; nothing tracks snow on the ground or melt.
 - **No fog, hail, drizzle, gusts or wind direction.** `frost` is only a `tmin` below 0, not ground frost.
-- **Metric only.** °C, mm, cm, m/s and km.
 - **Cells are independent.** Neighbouring cells with one seed do not share fronts; weather is not spatially correlated.
-- **No trend.** Every year is drawn from the same 1991-2020 climate, shifted by `warming` if set. There are no El Niño years, no droughts longer than the model's month anomalies carry, and no extremes beyond the fitted distributions.
+- **No trend.** Every year is drawn from the same 1991-2020 climate, shifted by `warming` if set, unless `historical` draws 1991-2020 as it was. There are no El Niño years outside that range, no droughts longer than the model's month anomalies carry, and no extremes beyond the fitted distributions.
 - **Dry spells run short.** Rain follows a first-order Markov chain, which makes the longest dry spell of a year about 6% shorter than in the records (10% in `lite`), and the wettest days (the 95th percentile) about 0.5 mm lighter. See [Data and Method](data.md#validation) for every measured bias.
 - **No Antarctica.** The climatology has no Antarctic cells, and the continent is too far from any other land for the 100 km rule: a point there throws.
 
@@ -287,6 +352,6 @@ gen.for_each_weather(dasmig::weather_request{}, {.count = 1'000'000, .threads = 
 
 | Exception | When |
 |-----------|------|
-| `std::runtime_error` | Any generation call or `climate_at` before data is loaded; a unique batch that runs out of attempts |
-| `std::invalid_argument` | A point more than 100 km from land (weather or `climate_at`); latitude or longitude out of range or set alone; elevation outside -500 to 9000 m; `warming` outside -10 to 10; an invalid date; `days` outside 1 to 36,600; no place requested and no cell with an `area` |
-| `dasmig::core::tsv_error` | A malformed `climate.tsv` or layer (message gives file, line and column); the data is unchanged |
+| `std::runtime_error` | Any generation call or `climate_at` before data is loaded; a historical request before `load_history()`; a unique batch that runs out of attempts |
+| `std::invalid_argument` | A point more than 100 km from land (weather or `climate_at`); latitude or longitude out of range or set alone; elevation outside -500 to 9000 m; `warming` outside -10 to 10; an invalid date or `units`; `days` outside 1 to 36,600; a historical day outside 1991-2020; no place requested and no cell with an `area` |
+| `dasmig::core::tsv_error` | A malformed `climate.tsv`, layer or `history.tsv` (message gives file, line and column); the data is unchanged |
