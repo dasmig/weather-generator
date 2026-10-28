@@ -167,7 +167,7 @@ Each call reads 48 days before its first day, so one day alone costs about as mu
 
 ```cpp
 paris.units = dasmig::unit_system::imperial;
-gen.get_weather(paris, 3); // 2024-01-15: light rain, 34.2 to 43.7 °F, 0.05 in
+gen.get_weather(paris, 3); // 2024-01-15: light rain, 34.1 to 43.6 °F, 0.05 in
 ```
 
 The JSON of an imperial day has `"units":"imperial"` after the date. A metric day has no `units` key, so metric JSON is exactly 1.0's.
@@ -207,9 +207,9 @@ The JSON of a day with hours has an `hours` array after `sunset`. A long hourly 
 `historical = true` draws each month around the month as it really was, from January 1991 to December 2020, instead of around the 1991-2020 normals. A cold winter is cold, a drought summer dry and a wet spring wet, while the days within each month are still drawn: the seed decides the weather of each day, and history decides the month's character.
 
 ```cpp
-gen.load_history();             // once: resources/history/history.tsv (about 20 MB)
+bool found = gen.load_history(); // once: resources/history/history.tsv (23 MB)
 dasmig::weather_request r{.latitude = 48.85, .longitude = 2.35, .date = 2010y / 1 / 1};
-r.historical = true;            // Paris in January 2010, about 3 °C colder than the normal
+r.historical = true;             // Paris in January 2010, 3.7 °C below the normal
 auto month = gen.get_weather_series(r, 31, 7);
 ```
 

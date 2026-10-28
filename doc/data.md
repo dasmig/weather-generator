@@ -9,7 +9,7 @@ The data in `resources/`, the model that turns it into days, and how well the re
 | `lite` | 2 degrees | 5,163 | 2.0 MB (`climate.tsv`) | about 60 ms |
 | `full` | 0.5 degrees | 67,213 | 26.0 MB | about 0.8 s |
 
-`lite` is compiled in with `DASMIG_WEATHER_EMBED` (2.1 MB of source). Both cover every land cell of the source except Antarctica, which the source does not have, and both carry the same 18 KB `land.tsv`. `full` follows coasts, mountains and rain shadows; `lite`'s 2-degree blocks average them away, so a point's normals are further from its own (see [Validation](#validation)).
+`lite` is compiled in with `DASMIG_WEATHER_EMBED` (2.1 MB of source). Historical requests also read `history/history.tsv` (23.1 MB, 5,163 2-degree blocks, below), for either tier; it is never compiled in. Both cover every land cell of the source except Antarctica, which the source does not have, and both carry the same 18 KB `land.tsv`. `full` follows coasts, mountains and rain shadows; `lite`'s 2-degree blocks average them away, so a point's normals are further from its own (see [Validation](#validation)).
 
 ## `climate.tsv`: monthly normals, derived
 
@@ -43,6 +43,18 @@ The land cells of the half-degree grid (the `full` cells), as runs of columns pe
 
 The mask's resolution is half a degree: a point on a small island or peninsula can read a few km out, and a wide estuary or a lake counts as land (Natural Earth's land includes lakes).
 
+## `history/history.tsv`: the months of 1991-2020, derived
+
+Keyed by `key`, the 2-degree block's centre (the `lite` keys), with `first_year` (1991) and three columns of 360 values separated by `;`, one per month from January 1991 to December 2020. Built by `scripts/prepare_history.py` from the same CRU TS 4.10 `tmp`, `pre` and `wet` grids as the normals, each month area-weighted over the block's half-degree land cells as `lite` is:
+
+| Column | Value | Reliability |
+| --- | --- | --- |
+| `tmean` | the month's mean temperature minus the block's 1991-2020 mean for that calendar month, °C, to 0.1 | good where `tmean` is: every land cell-month has a station within reach |
+| `precipitation` | the month's precipitation as a percentage of the block's normal, whole, 0 to 2000 (100 where the normal is below 0.05 mm) | fair: 89% of cell-months have a station within reach; the rest relax to CRU's climatology, so their months read as normal; desert months with a tiny normal swing wildly |
+| `wet_days` | the month's wet days minus the normal, days, to 0.1 | fair: as `wet_days` in the normals |
+
+The largest anomalies are 12.4 °C (a Siberian winter month), 2000% (the clip, in deserts) and 26.8 wet days. A cell of either tier takes the block its point lies in, so a `full` cell gets its block's anomaly on its own normals.
+
 ## Generation Model
 
 A Richardson (1981) type weather generator, the family of WGEN, LARS-WG and CLIGEN. Each day:
@@ -58,6 +70,14 @@ A Richardson (1981) type weather generator, the family of WGEN, LARS-WG and CLIG
 9. **Cloud, humidity, wind.** Wet days cover `0.6` of the clear sky left on top of the month's mean cloud and dry days less, so the monthly mean stays, and the day's cover is Beta with concentration 4. Humidity is normal around the monthly mean, `10` points higher on wet days (lower on dry days to keep the mean), spread `7` points, clamped to 5 to 100. Wind is Weibull with shape 2.90 around the monthly mean.
 10. **The sun.** Sunrise and sunset by NOAA's solar calculator equations (after Meeus): the sun's declination and the equation of time at the point's local mean noon, and the hour angle at which the sun's centre is 0.833° below the horizon (refraction and the sun's radius). Where that hour angle does not exist, the day is polar day or night (24 or 0 hours, no sunrise). Sunshine hours are the daylight times the clear share of the sky, 1 - cloud cover, a simplification (curated): real sunshine falls faster than cloud rises near the horizon and under thin cloud.
 11. **Elevation and warming.** Temperatures move by 6.5 °C per km between the requested and the cell's elevation, and by `warming`.
+12. **Historical months** (`historical`). Step 2's drawn anomalies are replaced by the month as it was: its temperature anomaly is added to the mean, the log ratio of its wet-day odds to the normal's scales the odds of a wet day, and the log ratio of its amount per wet day (precipitation ratio over wet-day ratio, clamped to ±3) scales the wet-day amount. Like the normals they are interpolated between mid-months through control points; the controls are the months filtered by the inverse of the `(1, 6, 1) / 8` interpolation, √2 r^|k| with r = 2√2 - 3 over 12 months each way, so a control does not depend on the days a call asks for. Months outside 1991-2020 have zero anomaly. The residual keeps its within-month share, sqrt(1 - 0.48² v).
+13. **Hours** (`hourly`; curated). From the day, its neighbours and the day's own `hours` stream, in local mean solar time:
+    - Temperature after Cesaraccio et al. (2001): a sine from Tmin at sunrise to Tmax at the warmest hour (max(sunset - 4 h, the middle of the day)), a sine down to the sunset temperature Tmax - 0.39 (Tmax - next Tmin), and a square-root fall to the next Tmin at the next sunrise; the hours before sunrise finish the night from the day before's sunset. Without a sunrise, a cosine between Tmin and Tmax, coolest at 03:00.
+    - Precipitation: a gamma (shape 2) number of wet hours with mean 2 + 2.5 ln(1 + mm), halved with thunder, rounded and at least 1; in one spell, or with probability 0.3 (not with thunder) two. Thunder spells are centred on a normal draw around 15:00. Each wet hour's weight is an exponential draw; the day's tenths of a mm are shared by weight with every wet hour given at least one, and the rest by largest remainder, so the hours sum to the day. Snowfall is shared the same way.
+    - Cloud: logistic(logit of the day's cover + an AR(1) normal, lag 0.8), at least 0.85 in a wet hour. Wind: the day's wind times (1 + 0.25 cos(15° (h - 14))) times log-normal AR(1) noise (sd 0.2, lag 0.8), scaled so the hours average to the day's wind.
+    - Humidity: the day's vapour pressure (humidity times the saturation pressure at Tmean, Magnus) over each hour's saturation pressure, clamped to 5 to 100, at least 90 in a wet hour. Sunshine: the day's hours shared by each hour's daylight times its clear sky, no hour above its daylight.
+    - None of these is fitted on hourly records: they are shapes from the literature and general climatology, consistent with the day by construction.
+14. **Imperial units** (`units`). The unrounded temperatures, amount and wind are converted (°F = 1.8 °C + 32; 25.4 mm per inch; 0.44704 m/s per mph) and rounded to 0.1 °F, 0.01 in, 0.1 in of snow and 0.1 mph. Nothing else changes.
 
 ### Determinism and series
 
@@ -65,11 +85,12 @@ A day must not depend on where a series started. Each day of each place has its 
 
 - The rain chain is read back to the latest day whose uniform draw decides the state whatever the day before was (below P(wet | dry), wet; above P(wet | wet), dry), and run forward from there. Within 48 days this fails with probability below 1e-20; then the chain starts from f.
 - The temperature residual is the sum of A^k B e(t - k) over the 48 days (A^48 is below 1e-7).
-- Month anomalies come from the place's month stream by month number.
+- Month anomalies come from the place's month stream by month number; historical months from the table, through controls of a fixed reach.
+- A day's hours come from its own stream (`hours`) and its neighbours' values, which a call simulates one day either side of the days it returns.
 
 So a day alone, a day inside any series and a day in an overlapping series are equal, which the tests check. The place seed is the call seed split by the cell key, so points in one cell share weather and different cells do not.
 
-All arithmetic is IEEE `+ - * /` and `sqrt` with contraction fenced, dasmig-core's `exp` and `log`, and the library's own `sin`, `cos` and `atan` series (for the cell search, the land distance and the sun), so results are identical on every compiler and CPU (known-answer tests at -O0 to -O3, with `-ffp-contract=fast` and `-march=native`, on GCC and Clang).
+All arithmetic is IEEE `+ - * /` and `sqrt` with contraction fenced, and dasmig-core's `exp`, `log` and degree trigonometry (for the cell search, the land distance, the sun and the hours), so results are identical on every compiler and CPU (known-answer tests at -O0 to -O3, with `-ffp-contract=fast` and `-march=native`, on GCC and Clang).
 
 ## Constants and Their Sources
 
@@ -93,7 +114,7 @@ Fitted by `scripts/calibrate.py fit` on **GHCN-Daily** (Menne et al. 2012, NOAA 
 - The wet-day shift of the mean (0.016 of the diurnal range): set so the generated dry-minus-wet Tmax matches the stations once the residuals and anomalies are added.
 - The month anomalies (0.48, 0.32, 0.28): set so the year-to-year spread of monthly Tmax, wet days and totals matches.
 
-**Curated**: the cloud and humidity contrasts of wet days (0.6, 10 points) and their spreads (Beta concentration 4, 7 points), from general climatology, since GHCN-Daily has no cloud or humidity; sunshine as daylight times the clear sky; the sleet threshold (snow with a daily mean above 1 °C), the 10:1 snow ratio, and the standard-atmosphere lapse rate (6.5 °C per km).
+**Curated**: everything in the hours (step 13); the cloud and humidity contrasts of wet days (0.6, 10 points) and their spreads (Beta concentration 4, 7 points), from general climatology, since GHCN-Daily has no cloud or humidity; sunshine as daylight times the clear sky; the sleet threshold (snow with a daily mean above 1 °C), the 10:1 snow ratio, and the standard-atmosphere lapse rate (6.5 °C per km).
 
 ## Validation
 
@@ -170,6 +191,7 @@ What this says:
 #    https://www.naturalearthdata.com/downloads/10m-physical-vectors/, unzipped into NE_DIR.
 #    prepare_climate.py imports numpy; run it without -I.
 python scripts/prepare_climate.py CRUTS_DIR CRUCL_DIR NE_DIR --tier all --out resources
+python scripts/prepare_history.py CRUTS_DIR CRUCL_DIR NE_DIR --out resources   # history/history.tsv
 make embed
 
 # 2. GHCN-Daily: ghcnd-inventory.txt and ghcnd-stations.txt from
@@ -193,4 +215,4 @@ The station lists are fixed by the inventory file; NCEI updates GHCN-Daily, so a
 
 ## Licences
 
-The climate tables are adapted from CRU TS 4.10 and CRU CL 2.0, which the Climatic Research Unit releases under the Open Database License with attribution and share-alike: weather generated from them is a Produced Work that needs a notice, and the tables themselves, or tables built from them, must stay under the ODbL. The land mask is from Natural Earth, in the public domain. GHCN-Daily records are not shipped; only constants fitted on them. See [`LICENSE_DATA.txt`](../LICENSE_DATA.txt).
+The climate tables and `history.tsv` are adapted from CRU TS 4.10 and CRU CL 2.0, which the Climatic Research Unit releases under the Open Database License with attribution and share-alike: weather generated from them is a Produced Work that needs a notice, and the tables themselves, or tables built from them, must stay under the ODbL. The land mask is from Natural Earth, in the public domain. GHCN-Daily records are not shipped; only constants fitted on them. See [`LICENSE_DATA.txt`](../LICENSE_DATA.txt).

@@ -785,7 +785,7 @@ class wtg
     /// @brief Load the months of 1991-2020 for historical requests, from the
     ///        compiled-in copy or `resources/history/history.tsv`.
     ///
-    /// Not loaded by instance() or load(): the table is large (about 20 MB)
+    /// Not loaded by instance() or load(): the table is large (23 MB)
     /// and only historical requests read it. It holds, for each 2-degree
     /// block of land, each month's temperature, precipitation and wet days
     /// against the 1991-2020 normals (CRU TS 4.10); a cell takes the
