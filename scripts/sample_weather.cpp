@@ -4,7 +4,11 @@
 //   TIER      lite or full
 //   STATIONS  tab-separated id, latitude, longitude, elevation (m)
 //   OUT       tab-separated id, date, tmax, tmin, precipitation, type, thunder,
-//             cloud_cover, humidity, wind
+//             cloud_cover, humidity, wind, snow_depth, gust, fog, condition,
+//             sunshine_hours
+//
+// Every station uses the same seed, so the sample is one world and nearby
+// stations share its weather as the library's spatial correlation gives.
 //
 // Build from the repository root:
 //   clang++ -std=c++23 -O2 -I. -o build/sample_weather scripts/sample_weather.cpp
@@ -31,7 +35,7 @@ int main(int argc, char** argv)
     std::ifstream in{argv[2]};
     std::ofstream out{argv[3]};
     std::string line;
-    std::uint64_t seed = 1;
+    constexpr std::uint64_t seed = 1;
     while (std::getline(in, line))
     {
         std::istringstream fields{line};
@@ -51,7 +55,7 @@ int main(int argc, char** argv)
         std::vector<dasmig::weather> series;
         try
         {
-            series = gen.get_weather_series(r, days, seed++);
+            series = gen.get_weather_series(r, days, seed);
         }
         catch (const std::invalid_argument& e)
         {
@@ -62,7 +66,8 @@ int main(int argc, char** argv)
         {
             out << id << '\t' << w.date_string() << '\t' << w.tmax << '\t' << w.tmin << '\t' << w.precipitation
                 << '\t' << dasmig::to_string(w.type) << '\t' << (w.thunder ? 1 : 0) << '\t' << w.cloud_cover << '\t'
-                << w.humidity << '\t' << w.wind << '\n';
+                << w.humidity << '\t' << w.wind << '\t' << w.snow_depth << '\t' << w.gust << '\t' << (w.fog ? 1 : 0)
+                << '\t' << dasmig::to_string(w.condition) << '\t' << w.sunshine_hours << '\n';
         }
     }
     return 0;

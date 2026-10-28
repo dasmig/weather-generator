@@ -207,7 +207,7 @@ def compare_cmd(ghcn, climate, sample, path):
             continue
         used += 1
         lat, lon = st[sid]
-        key = next((c for c in cal.near(lat, lon) if len(grid.get(c, {})) == 4), None)
+        key = next((c for c in cal.near(lat, lon) if len(grid.get(c, {})) == len(cal.STEMS)), None)
         cell = grid[key] if key is not None else None
         # The cell's temperatures moved to the station's elevation, as the
         # generated days are, so the comparison measures the model only.
