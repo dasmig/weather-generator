@@ -34,6 +34,8 @@ Daily weather for any place on land and any date: the low and the high, rain or 
 
 - **The Sun**. Sunrise, sunset and day length from NOAA's solar equations, polar day and night included, and the hours of sunshine the day's cloud lets through.
 
+- **Hours, Imperial Units and Real Years**. Ask for a day's 24 hours (a temperature curve from sunrise to the next night, rain in spells that add up to the day, cloud, wind, humidity and sunshine); for °F, inches and mph; or for any month of 1991-2020 as it really was (a cold winter cold, a drought summer dry), from CRU TS monthly records. All three are opt-in: a plain request gives the same days as before.
+
 - **Climate Normals Too**. `climate_at(lat, lon)` returns the monthly normals a place's weather is drawn around: temperature, diurnal range, precipitation, wet days, humidity, cloud and wind.
 
 - **Deterministic Seeding**. Per-call `get_weather(request, seed)` for reproducible results, and `weather::seed()` for replaying a previous generation with the same request and data.

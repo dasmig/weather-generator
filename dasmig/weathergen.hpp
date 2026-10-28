@@ -129,6 +129,39 @@ enum class weather_condition : std::uint8_t
     return "clear";
 }
 
+/// @brief The units of a result's weather values.
+enum class unit_system : std::uint8_t
+{
+    metric,  ///< °C, mm of precipitation, cm of snow, m/s.
+    imperial ///< °F, inches of precipitation and of snow, mph.
+};
+
+/// @brief The key of a unit system (`metric`, `imperial`).
+/// @param u The unit system.
+/// @return The key.
+[[nodiscard]] constexpr std::string_view to_string(unit_system u) noexcept
+{
+    return u == unit_system::imperial ? "imperial" : "metric";
+}
+
+/// @cond INTERNAL
+namespace weather_detail
+{
+
+// An instant as ISO 8601 UTC to the minute (`2024-01-15T07:42Z`).
+inline std::string time_string(std::chrono::sys_time<std::chrono::minutes> t)
+{
+    const auto day = std::chrono::floor<std::chrono::days>(t);
+    const std::chrono::year_month_day ymd{day};
+    const auto minutes = (t - day).count();
+    return std::format("{:04d}-{:02d}-{:02d}T{:02d}:{:02d}Z", static_cast<int>(ymd.year()),
+                       static_cast<unsigned>(ymd.month()), static_cast<unsigned>(ymd.day()), minutes / 60,
+                       minutes % 60);
+}
+
+} // namespace weather_detail
+/// @endcond
+
 /// @brief What a weather call asks for.
 ///
 /// Every generation call takes one; `weather_request{}` asks for the
@@ -161,6 +194,69 @@ struct weather_request
     ///        normals are 1991-2020 means (centred on 2005); land has warmed
     ///        about 0.3 °C a decade since.
     double warming{0.0};
+
+    /// @brief The units of the weather values (metric by default). The
+    ///        place keeps metres and km either way, and `warming` and
+    ///        `elevation` are always in °C and metres.
+    unit_system units{unit_system::metric};
+
+    /// @brief Also give each day's 24 hours in weather::hours. The days
+    ///        themselves are the same with or without them.
+    bool hourly{false};
+
+    /// @brief Draw each month around the month as it was (CRU TS, January
+    ///        1991 to December 2020) instead of around the normals: a cold
+    ///        winter is cold, a drought month is dry. Every day asked for
+    ///        must fall in 1991-2020, and load_history() must have loaded
+    ///        the months.
+    bool historical{false};
+};
+
+/// @brief One hour of a day's weather (weather::hours, when the request asks
+///        for them).
+///
+/// The hours are those of the place's mean solar day: hour 0 starts at local
+/// mean midnight, `4 * longitude` minutes before 00:00 UTC (east is
+/// earlier), so the day's lowest temperature comes near sunrise and the
+/// highest in the afternoon wherever the place is. In metric units the
+/// precipitation and snowfall of the 24 hours add up to the day's exactly.
+/// Values are rounded like the day's.
+struct weather_hour
+{
+    std::chrono::sys_time<std::chrono::minutes> time; ///< Start of the hour, UTC.
+    int hour{};              ///< Hour of the local mean solar day, 0 to 23.
+    double temperature{};    ///< Temperature at the start of the hour, °C (°F).
+    double precipitation{};  ///< Precipitation in the hour, mm (in).
+    double snowfall{};       ///< Fresh snow in the hour, cm (in).
+    precipitation_type type{precipitation_type::none}; ///< The form it falls in (none in a dry hour).
+    bool thunder{};          ///< Thunder in the hour.
+    double cloud_cover{};    ///< Cloud cover, 0 to 1.
+    double humidity{};       ///< Relative humidity, %.
+    double wind{};           ///< Mean wind speed at 10 m, m/s (mph).
+    double daylight_hours{}; ///< The part of the hour the sun is up, 0 to 1.
+    double sunshine_hours{}; ///< Bright sunshine in the hour, 0 to 1.
+    weather_condition condition{weather_condition::clear}; ///< The hour in a word.
+
+    /// @brief Write this hour as a JSON object.
+    /// @param w Writer positioned where a value is allowed.
+    void to_json(core::json_writer& w) const
+    {
+        w.begin_object()
+            .field("time", weather_detail::time_string(time))
+            .field("hour", hour)
+            .field("condition", dasmig::to_string(condition))
+            .field("temperature", temperature)
+            .field("precipitation", precipitation)
+            .field("snowfall", snowfall)
+            .field("type", dasmig::to_string(type))
+            .field("thunder", thunder)
+            .field("cloud_cover", cloud_cover)
+            .field("humidity", humidity)
+            .field("wind", wind)
+            .field("daylight_hours", daylight_hours)
+            .field("sunshine_hours", sunshine_hours)
+            .end_object();
+    }
 };
 
 /// @brief The monthly climate normals of a place (climate_at()).
@@ -219,9 +315,11 @@ struct climate_normals
 /// @brief One day's weather at one place.
 ///
 /// Values are rounded for output: temperatures, precipitation, snowfall and
-/// wind to 0.1, cloud cover to 0.01, humidity to whole percent. Supports
-/// implicit conversion to std::string (a one-line summary), streaming via
-/// operator<< and JSON output via to_json().
+/// wind to 0.1 (inches of precipitation to 0.01), cloud cover to 0.01,
+/// humidity to whole percent. The units are metric unless the request asked
+/// for imperial ones. Supports implicit conversion to std::string (a
+/// one-line summary), streaming via operator<< and JSON output via
+/// to_json().
 class weather
 {
   public:
@@ -231,17 +329,17 @@ class weather
     double longitude{};    ///< Degrees east: the requested point, or the drawn cell's.
     double elevation{};    ///< Metres: the requested elevation, or the cell's.
     double distance_km{};  ///< Distance from the point to land, km (0 on land; at most 100).
-    double tmin{};         ///< Lowest temperature, °C.
-    double tmean{};        ///< Mean temperature, °C: halfway between tmin and tmax.
-    double tmax{};         ///< Highest temperature, °C.
-    bool frost{};          ///< tmin below 0 °C.
-    double precipitation{}; ///< Precipitation, mm of water (0 on a dry day).
-    double snowfall{};     ///< Fresh snow, cm (10 cm per 10 mm of water).
+    double tmin{};         ///< Lowest temperature, °C (°F).
+    double tmean{};        ///< Mean temperature, °C (°F): halfway between tmin and tmax.
+    double tmax{};         ///< Highest temperature, °C (°F).
+    bool frost{};          ///< tmin below 0 °C (32 °F).
+    double precipitation{}; ///< Precipitation, mm (in) of water (0 on a dry day).
+    double snowfall{};     ///< Fresh snow, cm (in): 10 cm per 10 mm of water.
     precipitation_type type{precipitation_type::none}; ///< The form it falls in.
     bool thunder{};        ///< Thunder heard (on rain or sleet days only).
     double cloud_cover{};  ///< Mean cloud cover, 0 to 1.
     double humidity{};     ///< Mean relative humidity, %.
-    double wind{};         ///< Mean wind speed at 10 m, m/s.
+    double wind{};         ///< Mean wind speed at 10 m, m/s (mph).
     double daylight_hours{}; ///< Time from sunrise to sunset, hours (0 in polar night, 24 in polar day).
     double sunshine_hours{}; ///< Bright sunshine, hours: the daylight not covered by cloud.
     /// @brief Sunrise, UTC (unset in polar day and polar night). It can fall
@@ -250,6 +348,10 @@ class weather
     /// @brief Sunset, UTC (unset in polar day and polar night).
     std::optional<std::chrono::sys_time<std::chrono::minutes>> sunset{}; // NOLINT(readability-redundant-member-init)
     weather_condition condition{weather_condition::clear}; ///< The day in a word.
+    unit_system units{unit_system::metric}; ///< The units of the values above.
+    /// @brief The day's 24 hours, when the request set `hourly` (empty
+    ///        otherwise).
+    std::vector<weather_hour> hours;
 
     /// @brief Retrieve the random seed used to generate this weather.
     /// @return The call seed; pass it to get_weather(request, seed) with the
@@ -274,26 +376,24 @@ class weather
     /// @return The string.
     [[nodiscard]] static std::string time_string(std::chrono::sys_time<std::chrono::minutes> t)
     {
-        const auto day = std::chrono::floor<std::chrono::days>(t);
-        const std::chrono::year_month_day ymd{day};
-        const auto minutes = (t - day).count();
-        return std::format("{:04d}-{:02d}-{:02d}T{:02d}:{:02d}Z", static_cast<int>(ymd.year()),
-                           static_cast<unsigned>(ymd.month()), static_cast<unsigned>(ymd.day()), minutes / 60,
-                           minutes % 60);
+        return weather_detail::time_string(t);
     }
 
     /// @brief Human-readable summary string.
-    /// @return For example `2023-07-01: light rain, 14.2 to 21.9 °C, 1.3 mm`.
+    /// @return For example `2023-07-01: light rain, 14.2 to 21.9 °C, 1.3 mm`
+    ///         (`57.6 to 71.4 °F, 0.05 in` in imperial units).
     [[nodiscard]] std::string to_string() const
     {
-        std::string s = std::format("{}: {}, {:.1f} to {:.1f} °C", date_string(), label(condition), tmin, tmax);
+        const bool imperial = units == unit_system::imperial;
+        std::string s = std::format("{}: {}, {:.1f} to {:.1f} {}", date_string(), label(condition), tmin, tmax,
+                                    imperial ? "°F" : "°C");
         if (type == precipitation_type::snow || type == precipitation_type::sleet)
         {
-            s += std::format(", {:.1f} cm of snow", snowfall);
+            s += std::format(", {:.1f} {} of snow", snowfall, imperial ? "in" : "cm");
         }
         else if (type == precipitation_type::rain)
         {
-            s += std::format(", {:.1f} mm", precipitation);
+            s += imperial ? std::format(", {:.2f} in", precipitation) : std::format(", {:.1f} mm", precipitation);
         }
         return s;
     }
@@ -302,9 +402,10 @@ class weather
     /// @param w Writer positioned where a value is allowed.
     void to_json(core::json_writer& w) const
     {
-        w.begin_object()
-            .field("date", date_string())
-            .key("place")
+        w.begin_object().field("date", date_string());
+        // Metric days have no key, so their JSON is the same as 1.0's.
+        if (units == unit_system::imperial) w.field("units", dasmig::to_string(units));
+        w.key("place")
             .begin_object()
             .field("cell", cell)
             .field("latitude", latitude)
@@ -334,6 +435,12 @@ class weather
         };
         instant("sunrise", sunrise);
         instant("sunset", sunset);
+        if (!hours.empty())
+        {
+            w.key("hours").begin_array();
+            for (const auto& h : hours) h.to_json(w);
+            w.end_array();
+        }
         w.key("signature");
         _signature.to_json(w);
         w.end_object();
@@ -427,7 +534,8 @@ class wtg
     ///        Use weather_request{} for the defaults.
     /// @param request What to generate.
     /// @return The weather.
-    /// @throws std::runtime_error If no data has been loaded.
+    /// @throws std::runtime_error If no data has been loaded, or the request
+    ///         is historical and no history is loaded.
     /// @throws std::invalid_argument If the request is invalid.
     [[nodiscard]] weather get_weather(const weather_request& request)
     {
@@ -444,7 +552,7 @@ class wtg
     /// @throws std::invalid_argument If the request is invalid.
     [[nodiscard]] weather get_weather(const weather_request& request, std::uint64_t call_seed) const
     {
-        return std::move(simulate_(request, 1, call_seed).front());
+        return std::move(run_(request, 1, call_seed).front());
     }
 
     /// @brief Generate the weather of consecutive days.
@@ -477,7 +585,7 @@ class wtg
         {
             throw std::invalid_argument(std::format("weather-generator: days must be 1 to {}", max_series_days));
         }
-        return simulate_(request, days, call_seed);
+        return run_(request, days, call_seed);
     }
 
     /// @brief The monthly normals of the climate cell nearest a point.
@@ -674,6 +782,36 @@ class wtg
         return info;
     }
 
+    /// @brief Load the months of 1991-2020 for historical requests, from the
+    ///        compiled-in copy or `resources/history/history.tsv`.
+    ///
+    /// Not loaded by instance() or load(): the table is large (23 MB)
+    /// and only historical requests read it. It holds, for each 2-degree
+    /// block of land, each month's temperature, precipitation and wet days
+    /// against the 1991-2020 normals (CRU TS 4.10); a cell takes the
+    /// block its point lies in.
+    ///
+    /// @return False when the file was not found.
+    /// @throws core::tsv_error If the file is malformed.
+    [[nodiscard]] bool load_history()
+    {
+        auto doc = core::load_resource(std::string{history_file_}, embedded_files_(),
+                                       core::find_resources(library_name_, std::string{history_file_}));
+        if (!doc) return false;
+        read_history_(*doc);
+        return true;
+    }
+
+    /// @brief Load the months of 1991-2020 from a file.
+    /// @param file A `history.tsv`.
+    /// @throws core::tsv_error If the file cannot be read or is malformed;
+    ///         the months loaded before are then kept.
+    void load_history(const std::filesystem::path& file) { read_history_(core::tsv_document::load(file)); }
+
+    /// @brief Check whether historical requests can be served.
+    /// @return True when load_history() has loaded the months.
+    [[nodiscard]] bool has_history() const { return !_history.empty(); }
+
     /// @brief The data layers loaded, in order.
     /// @return The layer records.
     [[nodiscard]] const std::vector<core::layer_info>& layers() const { return _table.layers(); }
@@ -763,6 +901,30 @@ class wtg
 
         static constexpr double lapse_rate = 0.0065; // °C per metre (the standard atmosphere)
 
+        // Hours (curated; doc/data.md). Temperature after Cesaraccio et
+        // al. (2001): a sine from tmin at sunrise up to tmax at the warmest
+        // hour, sunset - 4 h (or midway in a short day), a sine down to the
+        // sunset temperature, tmax - sunset_share (tmax - the next tmin),
+        // and a square-root fall to the next tmin at the next sunrise.
+        static constexpr double sunset_share = 0.39;
+        static constexpr double warmest_before_sunset = 4.0;
+        // Wet hours: 2 + 2.5 ln(1 + mm) on average (half that with
+        // thunder), gamma distributed with shape 2, in one spell or, with
+        // two_spells, two.
+        static constexpr double wet_hours0 = 2.0;
+        static constexpr double wet_hours1 = 2.5;
+        static constexpr double two_spells = 0.3;
+        static constexpr double thunder_hour = 15.0; // a thunder spell is centred on 15:00 local
+        // Wind: a 25% swing peaking at 14:00 local, times log-normal noise;
+        // cloud: logit noise around the day's cover. Both lag-1 correlated.
+        static constexpr double wind_swing = 0.25;
+        static constexpr double windiest_hour = 14.0;
+        static constexpr double wind_noise = 0.2;
+        static constexpr double cloud_noise = 1.0;
+        static constexpr double hour_lag = 0.8;
+        static constexpr double wet_hour_cloud = 0.85;
+        static constexpr double wet_hour_humidity = 90.0;
+
         // Days read back: the temperature residual sums this many days of
         // innovations (A^window is below 1e-7), and the rain chain looks
         // back at most this far for the day its state stops mattering.
@@ -774,6 +936,18 @@ class wtg
     static constexpr std::string_view library_name_ = "weather-generator";
     static constexpr std::string_view data_file_ = "climate.tsv";
     static constexpr std::string_view land_file_ = "land.tsv";
+
+    // The months of history.tsv: 2-degree blocks (90 rows of 180), each with
+    // history_months months from January of history_first_year.
+    static constexpr std::string_view history_file_ = "history/history.tsv";
+    static constexpr int history_first_year = 1991;
+    static constexpr int history_last_year = 2020;
+    static constexpr int history_months = 12 * (history_last_year - history_first_year + 1);
+    static constexpr int history_rows = 90;
+    static constexpr int history_columns = 180;
+    // Per month: temperature anomaly (°C), precipitation (% of normal) and
+    // wet-day anomaly (days).
+    using history_month = std::array<float, 3>;
 
     // The land cells of a 0.5-degree grid, as runs of columns per row: row
     // i is centred at -89.75 + 0.5 i, column j at -179.75 + 0.5 j.
@@ -804,6 +978,67 @@ class wtg
             std::ranges::sort(mask[static_cast<std::size_t>(i)]);
         }
         return mask;
+    }
+
+    // The index of the 2-degree block a point lies in, row-major.
+    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters): latitude, longitude as everywhere
+    static std::size_t history_block_of_(double latitude, double longitude)
+    {
+        const auto row = std::clamp(static_cast<int>(std::floor((latitude + 90.0) / 2.0)), 0, history_rows - 1);
+        const auto column =
+            std::clamp(static_cast<int>(std::floor((longitude + 180.0) / 2.0)), 0, history_columns - 1);
+        return (static_cast<std::size_t>(row) * history_columns) + static_cast<std::size_t>(column);
+    }
+
+    void read_history_(const core::tsv_document& doc)
+    {
+        std::vector<std::int32_t> block(static_cast<std::size_t>(history_rows * history_columns), -1);
+        std::vector<history_month> months;
+        for (const auto& row : doc.rows())
+        {
+            // The key is the block's centre, "latitude,longitude".
+            const auto key = row.get<std::string>("key");
+            const auto comma = key.find(',');
+            const auto lat = core::detail::parse_number<double>(std::string_view{key}.substr(0, comma));
+            const auto lon = comma == std::string::npos
+                                 ? std::nullopt
+                                 : core::detail::parse_number<double>(std::string_view{key}.substr(comma + 1));
+            if (!lat || !lon || outside_(*lat, -90.0, 90.0) || outside_(*lon, -180.0, 180.0))
+            {
+                throw row.error("key", "must be a block centre such as 49.00,3.00");
+            }
+            if (row.get<int>("first_year") != history_first_year)
+            {
+                throw row.error("first_year", std::format("must be {}", history_first_year));
+            }
+            auto& slot = block[history_block_of_(*lat, *lon)];
+            if (slot >= 0) throw row.error("key", "repeats a block");
+            slot = static_cast<std::int32_t>(months.size());
+            months.resize(months.size() + history_months);
+            const std::array<std::pair<std::string_view, std::pair<double, double>>, 3> columns{
+                {{"tmean", {-40.0, 40.0}}, {"precipitation", {0.0, 100000.0}}, {"wet_days", {-31.0, 31.0}}}};
+            for (std::size_t v = 0; v < columns.size(); ++v)
+            {
+                const auto& [name, range] = columns.at(v);
+                const auto items = row.list(name);
+                if (items.size() != static_cast<std::size_t>(history_months))
+                {
+                    throw row.error(name, std::format("must hold {} values separated by ';'", history_months));
+                }
+                for (std::size_t m = 0; m < items.size(); ++m)
+                {
+                    const auto x = core::detail::parse_number<double>(items[m]);
+                    if (!x || outside_(*x, range.first, range.second))
+                    {
+                        throw row.error(name, std::format("values must be {} to {}", range.first, range.second));
+                    }
+                    months[static_cast<std::size_t>(slot) + m].at(v) = static_cast<float>(*x);
+                }
+            }
+        }
+        _history_block = std::move(block);
+        _history = std::move(months);
+        _history_hash = doc.content_hash();
     }
 
     static core::table_schema schema_()
@@ -905,6 +1140,10 @@ class wtg
     std::vector<std::uint32_t> _tree; // k-d tree over the cells' unit vectors (implicit, median-split)
     core::weighted_table<std::size_t> _area; // cell index, by land area
     land_mask _land;                         // empty when the data has no land.tsv
+
+    std::vector<std::int32_t> _history_block; // block row * 180 + column -> first month in _history, or -1
+    std::vector<history_month> _history;
+    std::uint64_t _history_hash{0};
 
     core::rng _engine{core::rng::from_entropy()};
 
@@ -1140,9 +1379,85 @@ class wtg
         std::vector<std::array<double, 2>> _values;
     };
 
+    // The months as they were at one cell, for historical requests: per
+    // month index (year * 12 + month - 1) the controls of the temperature
+    // anomaly and of the log ratios of the wet-day odds and the wet-day
+    // amount to the normals'. A control is the inverse of the
+    // interpolation's (1, 6, 1) / 8 filter applied to the months around it,
+    // over a fixed reach, so it does not depend on the days a call asks for.
+    class month_history
+    {
+      public:
+        month_history(const cell& c, std::span<const history_month> months)
+            : _wet_days{c.normals.wet_days}, _months{months}
+        {
+        }
+
+        std::array<double, 3> operator()(std::int64_t index)
+        {
+            if (_values.empty()) _first = index;
+            while (_first + static_cast<std::int64_t>(_values.size()) <= index)
+            {
+                _values.push_back(control_(_first + static_cast<std::int64_t>(_values.size())));
+            }
+            return _values[static_cast<std::size_t>(index - _first)];
+        }
+
+      private:
+        static constexpr int reach = 12; // r^12 is below 1e-9
+        static constexpr double root = -0.17157287525380990;  // 2 sqrt(2) - 3
+        static constexpr double gain = std::numbers::sqrt2;   // 8 / sqrt(32)
+
+        // The month's own values; zero outside the record or the data.
+        [[nodiscard]] std::array<double, 3> month_(std::int64_t index) const
+        {
+            const std::int64_t first = static_cast<std::int64_t>(history_first_year) * 12;
+            if (_months.empty() || index < first || index >= first + history_months) return {0.0, 0.0, 0.0};
+            const auto& h = _months[static_cast<std::size_t>(index - first)];
+            const auto m = static_cast<std::size_t>(((index % 12) + 12) % 12);
+            const auto year = static_cast<int>(index / 12);
+            const double normal_length = month_length_(2001, static_cast<unsigned>(m + 1));
+            const double length = month_length_(year, static_cast<unsigned>(m + 1));
+            const double wet = _wet_days.at(m);
+            const double wet_now = std::max(wet + static_cast<double>(h[2]), 0.0);
+            const auto log_odds = [](double f)
+            {
+                const double g = std::clamp(f, 0.005, 0.995);
+                return core::math::log(g / (1.0 - g));
+            };
+            const double odds = log_odds(wet_now / length) - log_odds(std::min(wet, normal_length) / normal_length);
+            // The amount per wet day: the precipitation's ratio over the
+            // wet days'.
+            double amount = core::math::log(std::max(static_cast<double>(h[1]) / 100.0, 0.05));
+            if (wet >= 0.1 && wet_now >= 0.1) amount -= core::math::log(wet_now / wet);
+            return {static_cast<double>(h[0]), odds, std::clamp(amount, -3.0, 3.0)};
+        }
+
+        [[nodiscard]] std::array<double, 3> control_(std::int64_t index) const
+        {
+            std::array<double, 3> out{};
+            double weight = gain;
+            for (int k = 0; k <= reach; ++k)
+            {
+                const auto a = month_(index + k);
+                const auto b = k == 0 ? std::array<double, 3>{} : month_(index - k);
+                for (std::size_t v = 0; v < 3; ++v) out.at(v) += core::math::fenced(weight * (a.at(v) + b.at(v)));
+                weight *= root;
+            }
+            return out;
+        }
+
+        months _wet_days;
+        std::span<const history_month> _months;
+        std::int64_t _first{0};
+        std::vector<std::array<double, 3>> _values;
+    };
+
     // A day's parameters, interpolated between the controls of the months
-    // around it, with the months' anomalies interpolated the same way.
-    static day_params params_(const cell& c, std::chrono::year_month_day ymd, month_anomalies& anomalies)
+    // around it, with the months' anomalies interpolated the same way (or,
+    // when @p history is set, the months as they were).
+    static day_params params_(const cell& c, std::chrono::year_month_day ymd, month_anomalies& anomalies,
+                              month_history* history)
     {
         const auto month = static_cast<unsigned>(ymd.month());
         const int year = static_cast<int>(ymd.year());
@@ -1156,6 +1471,8 @@ class wtg
         const auto i = static_cast<std::size_t>(((index % 12) + 12) % 12);
         const std::size_t j = (i + 1) % 12;
         const auto lerp = [&](const months& v) { return v.at(i) + core::math::fenced(t * (v.at(j) - v.at(i))); };
+
+        if (history != nullptr) return historical_params_(c, *history, index, t, lerp);
 
         const auto a = anomalies(index);
         const auto b = anomalies(index + 1);
@@ -1190,6 +1507,34 @@ class wtg
         p.cloud = std::clamp(lerp(c.cloud), 0.0, 1.0);
         p.wind = std::max(lerp(c.wind), 0.0);
         p.anomaly = za;
+        p.residual = std::sqrt(1.0 - core::math::fenced(model::temperature_month * model::temperature_month * v));
+        return p;
+    }
+
+    // A historical day: the normals moved by the months as they were, with
+    // no drawn month anomaly. The residual keeps the share it has on a
+    // normal day, which is the spread within a month.
+    template <typename Lerp>
+    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters): a month index and a share of it
+    static day_params historical_params_(const cell& c, month_history& history, std::int64_t index, double t,
+                                         const Lerp& lerp)
+    {
+        const auto a = history(index);
+        const auto b = history(index + 1);
+        const auto at = [&](std::size_t k) { return a.at(k) + core::math::fenced(t * (b.at(k) - a.at(k))); };
+        const double v = core::math::fenced((1.0 - t) * (1.0 - t)) + core::math::fenced(t * t);
+        const double f = std::clamp(lerp(c.wet), 0.0, 1.0);
+        const double wet_odds = core::math::fenced(f * core::math::exp(at(1)));
+
+        day_params p{};
+        p.tmean = lerp(c.tmean) + at(0);
+        p.dtr = std::max(lerp(c.dtr), 0.0);
+        p.wet = std::min(wet_odds / (wet_odds + (1.0 - f)), 0.995);
+        p.amount = std::max(lerp(c.amount) * core::math::exp(at(2)), 0.1);
+        p.humidity = std::clamp(lerp(c.humidity), 1.0, 100.0);
+        p.cloud = std::clamp(lerp(c.cloud), 0.0, 1.0);
+        p.wind = std::max(lerp(c.wind), 0.0);
+        p.anomaly = 0.0;
         p.residual = std::sqrt(1.0 - core::math::fenced(model::temperature_month * model::temperature_month * v));
         return p;
     }
@@ -1317,6 +1662,10 @@ class wtg
         if (outside_(request.warming, -10.0, 10.0))
         {
             throw std::invalid_argument("weather-generator: warming must be -10 to 10 °C");
+        }
+        if (request.units != unit_system::metric && request.units != unit_system::imperial)
+        {
+            throw std::invalid_argument("weather-generator: units must be metric or imperial");
         }
     }
 
@@ -1489,8 +1838,9 @@ class wtg
         return {.mean = mean, .tmax = mean + (0.5 * range), .tmin = mean - (0.5 * range)};
     }
 
-    // Amount, form and thunder of a wet day.
-    static void precipitation_(weather& w, const day_params& p, const temperatures& t, const core::rng& day)
+    // Amount, form and thunder of a wet day; returns the amount before
+    // rounding.
+    static double precipitation_(weather& w, const day_params& p, const temperatures& t, const core::rng& day)
     {
         auto r = day.split("amount");
         const double shape = std::clamp(model::shape0 + core::math::fenced(model::shape1 * core::math::log(p.amount)),
@@ -1515,10 +1865,12 @@ class wtg
                 c[0] + core::math::fenced(c[1] * t.tmax) + core::math::fenced(c[2] * core::math::log(amount));
             w.thunder = core::uniform01(th) < logistic_(z);
         }
+        return amount;
     }
 
-    // Cloud cover, humidity and wind, which follow the wet and dry days.
-    static void sky_(weather& w, const day_params& p, bool wet, const core::rng& day)
+    // Cloud cover, humidity and wind, which follow the wet and dry days;
+    // returns the wind before rounding.
+    static double sky_(weather& w, const day_params& p, bool wet, const core::rng& day)
     {
         const double f = p.wet;
         {
@@ -1539,18 +1891,69 @@ class wtg
         }
         {
             auto r = day.split("wind");
-            w.wind = round_to_(core::weibull(r, model::wind_shape, p.wind / model::wind_gamma), 10.0);
+            const double wind = core::weibull(r, model::wind_shape, p.wind / model::wind_gamma);
+            w.wind = round_to_(wind, 10.0);
+            return wind;
         }
     }
 
-    // The weather of `days` days from request.date, each from its own
-    // stream, with `window` days before the first read for the chains.
+    // One simulated day: the weather in metric units, and what the hours and
+    // the imperial units need before rounding.
+    struct day_result
+    {
+        weather w;
+        temperatures t{};
+        double amount{0.0}; // mm (0 on a dry day)
+        double wind{0.0};   // m/s
+        sun s{};
+        std::uint64_t seed{0}; // the day's stream
+    };
+
+    // The weather of `days` days from request.date: checks the request,
+    // simulates (with the day before and after for the hours), adds the
+    // hours and converts the units.
     // NOLINTNEXTLINE(bugprone-easily-swappable-parameters): days and seed differ in type and meaning
-    [[nodiscard]] std::vector<weather> simulate_(const weather_request& request, int days,
-                                                 std::uint64_t call_seed) const
+    [[nodiscard]] std::vector<weather> run_(const weather_request& request, int days, std::uint64_t call_seed) const
     {
         require_data_();
         check_request_(request);
+        if (request.historical)
+        {
+            if (_history.empty())
+            {
+                throw std::runtime_error("No weather history loaded. Call load_history() first.");
+            }
+            const auto first = static_cast<int>(request.date.year());
+            const auto last = static_cast<int>(
+                std::chrono::year_month_day{std::chrono::sys_days{request.date} + std::chrono::days{days - 1}}.year());
+            if (first < history_first_year || last > history_last_year)
+            {
+                throw std::invalid_argument(std::format("weather-generator: historical days must fall in {} to {}",
+                                                        history_first_year, history_last_year));
+            }
+        }
+        const int extra = request.hourly ? 1 : 0;
+        auto sim = simulate_(request, -extra, days + (2 * extra), call_seed);
+        std::vector<weather> out;
+        out.reserve(static_cast<std::size_t>(days));
+        const bool imperial = request.units == unit_system::imperial;
+        for (int k = extra; k < extra + days; ++k)
+        {
+            const auto at = static_cast<std::size_t>(k);
+            auto& d = sim[at];
+            if (request.hourly) d.w.hours = hours_(sim[at - 1], d, sim[at + 1], imperial);
+            if (imperial) to_imperial_(d);
+            out.push_back(std::move(d.w));
+        }
+        return out;
+    }
+
+    // The days from request.date + offset, each from its own stream, with
+    // `window` days before the first read for the chains.
+    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters): offset, days and seed differ in meaning
+    [[nodiscard]] std::vector<day_result> simulate_(const weather_request& request, int offset, int days,
+                                                    std::uint64_t call_seed) const
+    {
         const core::rng call{call_seed};
         const place where = place_(request, call);
         const cell& c = _cells[where.cell];
@@ -1562,7 +1965,18 @@ class wtg
         // different cells, and the same weather at points of one cell.
         const std::uint64_t place_seed = call.split(c.normals.cell).seed();
         month_anomalies anomalies{core::rng{place_seed}.split("month").seed()};
-        const auto first = std::chrono::sys_days{request.date} - std::chrono::days{model::window};
+        std::optional<month_history> history;
+        if (request.historical)
+        {
+            const auto slot = _history_block[history_block_of_(c.normals.latitude, c.normals.longitude)];
+            history.emplace(c, slot < 0 ? std::span<const history_month>{}
+                                        : std::span{_history}.subspan(static_cast<std::size_t>(slot),
+                                                                      history_months));
+        }
+        const std::uint64_t data =
+            request.historical ? core::hash_combine(data_hash(), _history_hash) : data_hash();
+        const auto first =
+            std::chrono::sys_days{request.date} + std::chrono::days{offset} - std::chrono::days{model::window};
         const int span = model::window + days;
 
         std::vector<day_draws> draws(static_cast<std::size_t>(span));
@@ -1571,33 +1985,37 @@ class wtg
             const auto day = first + std::chrono::days{k};
             const core::rng day_rng{core::rng::child_seed_of(place_seed, day_index_(day))};
             auto& d = draws[static_cast<std::size_t>(k)];
-            d.p = params_(c, std::chrono::year_month_day{day}, anomalies);
+            d.p = params_(c, std::chrono::year_month_day{day}, anomalies, history ? &*history : nullptr);
             auto u = day_rng.split("wet");
             d.u_wet = core::uniform01(u);
             auto e = day_rng.split("temperature");
             d.e = {core::normal(e, 0.0, 1.0), core::normal(e, 0.0, 1.0)};
         }
 
-        std::vector<weather> out;
+        std::vector<day_result> out;
         out.reserve(static_cast<std::size_t>(days));
         for (int k = model::window; k < span; ++k)
         {
             const auto day = first + std::chrono::days{k};
-            const core::rng day_rng{core::rng::child_seed_of(place_seed, day_index_(day))};
+            const std::uint64_t day_seed = core::rng::child_seed_of(place_seed, day_index_(day));
+            const core::rng day_rng{day_seed};
             const auto& p = draws[static_cast<std::size_t>(k)].p;
             const bool wet = wet_on_(draws, k);
             const auto t = temperatures_(draws, k, wet, c, shift);
 
-            weather w;
-            w._signature = {.seed = call_seed, .data = data_hash()};
+            day_result result;
+            result.t = t;
+            result.seed = day_seed;
+            weather& w = result.w;
+            w._signature = {.seed = call_seed, .data = data};
             w.date = std::chrono::year_month_day{day};
             w.cell = c.normals.cell;
             w.latitude = where.latitude;
             w.longitude = where.longitude;
             w.elevation = round_to_(elevation, 1.0);
             w.distance_km = round_to_(where.distance_km, 10.0);
-            if (wet) precipitation_(w, p, t, day_rng);
-            sky_(w, p, wet, day_rng);
+            if (wet) result.amount = precipitation_(w, p, t, day_rng);
+            result.wind = sky_(w, p, wet, day_rng);
             w.tmin = round_to_(t.tmin, 10.0);
             w.tmean = round_to_(t.mean, 10.0);
             w.tmax = round_to_(t.tmax, 10.0);
@@ -1612,9 +2030,348 @@ class wtg
             if (sun.rise) w.sunrise = instant(*sun.rise);
             if (sun.set) w.sunset = instant(*sun.set);
             w.condition = condition_(w);
-            out.push_back(std::move(w));
+            result.s = sun;
+            out.push_back(std::move(result));
         }
         return out;
+    }
+
+    // -- Units ------------------------------------------------------------
+
+    static double fahrenheit_(double celsius) { return core::math::fenced(celsius * 1.8) + 32.0; }
+    static constexpr double mm_per_inch = 25.4;
+    static constexpr double metres_per_second_per_mph = 0.44704;
+
+    // The day in imperial units, from the values before rounding.
+    static void to_imperial_(day_result& d)
+    {
+        weather& w = d.w;
+        w.units = unit_system::imperial;
+        w.tmin = round_to_(fahrenheit_(d.t.tmin), 10.0);
+        w.tmean = round_to_(fahrenheit_(d.t.mean), 10.0);
+        w.tmax = round_to_(fahrenheit_(d.t.tmax), 10.0);
+        w.precipitation = round_to_(d.amount / mm_per_inch, 100.0);
+        // A cm of snow per mm of water, sleet half of it, in inches.
+        double snow_cm = 0.0;
+        if (w.type == precipitation_type::snow) snow_cm = d.amount;
+        if (w.type == precipitation_type::sleet) snow_cm = d.amount / 2.0;
+        w.snowfall = round_to_(snow_cm / (mm_per_inch / 10.0), 10.0);
+        w.wind = round_to_(d.wind / metres_per_second_per_mph, 10.0);
+    }
+
+    // -- Hours ------------------------------------------------------------
+
+    // Spread `tenths` over the hours by `weights`: each hour gets its share
+    // rounded down, then the hours with the largest remainders (the earlier
+    // first) one more, so the hours add up to `tenths` exactly; `floor` is
+    // given to every hour with a positive weight first.
+    static std::array<long long, 24> allocate_(long long tenths, const std::array<double, 24>& weights,
+                                               long long floor)
+    {
+        std::array<long long, 24> out{};
+        double total = 0.0;
+        long long given = 0;
+        for (std::size_t h = 0; h < 24; ++h)
+        {
+            if (weights.at(h) > 0.0)
+            {
+                total += weights.at(h);
+                out.at(h) = floor;
+                given += floor;
+            }
+        }
+        const long long rest = tenths - given;
+        if (rest <= 0 || total <= 0.0) return out;
+        std::array<double, 24> remainder{};
+        for (std::size_t h = 0; h < 24; ++h)
+        {
+            const double share = static_cast<double>(rest) * weights.at(h) / total;
+            const double whole = std::floor(share);
+            out.at(h) += static_cast<long long>(whole);
+            given += static_cast<long long>(whole);
+            remainder.at(h) = weights.at(h) > 0.0 ? share - whole : -1.0;
+        }
+        for (long long left = tenths - given; left > 0; --left)
+        {
+            std::size_t best = 0;
+            for (std::size_t h = 1; h < 24; ++h)
+            {
+                if (remainder.at(h) > remainder.at(best)) best = h;
+            }
+            ++out.at(best);
+            remainder.at(best) = -1.0;
+        }
+        return out;
+    }
+
+    // Saturation vapour pressure over water, hPa (Magnus; WMO 2008).
+    static double saturation_(double celsius)
+    {
+        return 6.112 * core::math::exp((17.62 * celsius) / (243.12 + celsius));
+    }
+
+    // A day's 24 hours from the day itself and its neighbours (for the
+    // night before sunrise and after sunset), from the day's "hours" stream.
+    // NOLINTNEXTLINE(readability-function-cognitive-complexity): one pass per element
+    static std::vector<weather_hour> hours_(const day_result& before, const day_result& d,
+                                            const day_result& after, bool imperial)
+    {
+        using core::math::fenced;
+        const weather& w = d.w;
+        // Local mean solar hours from the local midnight of the date.
+        const double solar = 4.0 * w.longitude; // minutes ahead of UTC
+        const auto local = [&](double utc_minutes, double day_shift)
+        { return ((utc_minutes + solar) / 60.0) + day_shift; };
+
+        // Temperature: the sunrise, warmest hour and sunset of the day, the
+        // sunset before and the sunrise after.
+        std::array<double, 24> temperature{};
+        const double tn = w.tmin;
+        const double tx = w.tmax;
+        if (d.s.rise && d.s.set)
+        {
+            const double rise = local(*d.s.rise, 0.0);
+            const double set = local(*d.s.set, 0.0);
+            const double warmest = std::max(set - model::warmest_before_sunset, (rise + set) / 2.0);
+            const double set_before = before.s.set ? local(*before.s.set, -24.0) : set - 24.0;
+            const double rise_after = after.s.rise ? local(*after.s.rise, 24.0) : rise + 24.0;
+            const double next = after.w.tmin;
+            const double dusk = tx - fenced(model::sunset_share * (tx - next));
+            const double dusk_before = before.w.tmax - fenced(model::sunset_share * (before.w.tmax - tn));
+            for (int h = 0; h < 24; ++h)
+            {
+                const auto t = static_cast<double>(h);
+                double v = 0.0;
+                if (t < rise)
+                {
+                    const double share = std::max(0.0, t - set_before) / std::max(rise - set_before, 1e-6);
+                    v = dusk_before + fenced((tn - dusk_before) * std::sqrt(std::min(share, 1.0)));
+                }
+                else if (t <= warmest)
+                {
+                    v = tn + fenced((tx - tn) * core::math::sin_deg(90.0 * (t - rise) / std::max(warmest - rise, 1e-6)));
+                }
+                else if (t <= set)
+                {
+                    const double angle = 90.0 + (90.0 * (t - warmest) / std::max(set - warmest, 1e-6));
+                    v = dusk + fenced((tx - dusk) * core::math::sin_deg(angle));
+                }
+                else
+                {
+                    const double share = (t - set) / std::max(rise_after - set, 1e-6);
+                    v = dusk + fenced((next - dusk) * std::sqrt(std::min(share, 1.0)));
+                }
+                temperature.at(static_cast<std::size_t>(h)) = v;
+            }
+        }
+        else
+        {
+            // Polar day or night: a plain daily wave, coolest at 03:00.
+            for (int h = 0; h < 24; ++h)
+            {
+                const double wave = core::math::cos_deg(15.0 * (static_cast<double>(h) - 15.0));
+                temperature.at(static_cast<std::size_t>(h)) = ((tn + tx) / 2.0) + fenced(((tx - tn) / 2.0) * wave);
+            }
+        }
+
+        // The part of each hour the sun is up.
+        std::array<double, 24> daylight{};
+        for (int h = 0; h < 24; ++h)
+        {
+            double up = w.daylight_hours >= 24.0 ? 1.0 : 0.0;
+            if (d.s.rise && d.s.set)
+            {
+                const double from = std::max(static_cast<double>(h), local(*d.s.rise, 0.0));
+                const double to = std::min(static_cast<double>(h + 1), local(*d.s.set, 0.0));
+                up = std::max(0.0, to - from);
+            }
+            daylight.at(static_cast<std::size_t>(h)) = up;
+        }
+
+        const core::rng stream = core::rng{d.seed}.split("hours");
+
+        // Precipitation: one or two spells of wet hours, the day's amount
+        // spread over them by exponential weights.
+        std::array<double, 24> weights{};
+        std::array<long long, 24> water{};
+        std::array<long long, 24> snow{};
+        if (w.type != precipitation_type::none)
+        {
+            auto r = stream.split("precipitation");
+            const long long tenths = std::llround(w.precipitation * 10.0);
+            const double mean = (model::wet_hours0 + fenced(model::wet_hours1 * core::math::log(1.0 + w.precipitation))) *
+                                (w.thunder ? 0.5 : 1.0);
+            const long long drawn = std::llround(core::gamma(r, 2.0, mean / 2.0));
+            const long long wet_hours = std::clamp<long long>(drawn, 1, std::min<long long>(24, tenths));
+            const bool two = core::uniform01(r) < model::two_spells && !w.thunder && wet_hours >= 2;
+            const long long first = two ? 1 + static_cast<long long>(core::bounded(r, static_cast<std::uint64_t>(wet_hours - 1)))
+                                        : wet_hours;
+            const auto spell = [&](long long length, long long start)
+            {
+                for (long long h = start; h < start + length; ++h)
+                {
+                    const double u = 1.0 - core::uniform01(r); // (0, 1]
+                    weights.at(static_cast<std::size_t>(h)) += -core::math::log(u) + 1e-9;
+                }
+            };
+            long long start = 0;
+            if (w.thunder)
+            {
+                const long long centre = std::llround(core::normal(r, model::thunder_hour, 2.0));
+                start = std::clamp<long long>(centre - (first / 2), 0, 24 - first);
+            }
+            else
+            {
+                start = core::uniform_int<long long>(r, 0, 24 - first);
+            }
+            spell(first, start);
+            if (two) spell(wet_hours - first, core::uniform_int<long long>(r, 0, 24 - (wet_hours - first)));
+            water = allocate_(tenths, weights, 1);
+            const long long snow_tenths = std::llround(w.snowfall * 10.0);
+            snow = w.type == precipitation_type::snow ? water : allocate_(snow_tenths, weights, 0);
+        }
+
+        // Cloud and wind: lag-1 noise around the day's values (the wind's
+        // mean then scaled to the day's).
+        auto rc = stream.split("cloud");
+        auto rw = stream.split("wind");
+        const double lag_sd = std::sqrt(1.0 - fenced(model::hour_lag * model::hour_lag));
+        double xc = core::normal(rc, 0.0, 1.0);
+        double xw = core::normal(rw, 0.0, 1.0);
+        const double cover = std::clamp(w.cloud_cover, 0.01, 0.99);
+        const double cloud_logit = core::math::log(cover / (1.0 - cover));
+        std::array<double, 24> cloud{};
+        std::array<double, 24> wind{};
+        for (std::size_t h = 0; h < 24; ++h)
+        {
+            if (h > 0)
+            {
+                xc = fenced(model::hour_lag * xc) + fenced(lag_sd * core::normal(rc, 0.0, 1.0));
+                xw = fenced(model::hour_lag * xw) + fenced(lag_sd * core::normal(rw, 0.0, 1.0));
+            }
+            cloud.at(h) = logistic_(cloud_logit + fenced(model::cloud_noise * xc));
+            if (water.at(h) > 0) cloud.at(h) = std::max(cloud.at(h), model::wet_hour_cloud);
+            const double swing =
+                1.0 + fenced(model::wind_swing *
+                             core::math::cos_deg(15.0 * (static_cast<double>(h) - model::windiest_hour)));
+            const double noise = core::math::exp(fenced(model::wind_noise * xw) -
+                                                  (0.5 * model::wind_noise * model::wind_noise));
+            wind.at(h) = swing * noise;
+        }
+        // Scaled so the hours' mean is the day's wind.
+        double wind_sum = 0.0;
+        for (const double x : wind) wind_sum += x;
+        for (double& x : wind) x = wind_sum > 0.0 ? d.wind * x * 24.0 / wind_sum : 0.0;
+
+        // Sunshine: the day's hours shared by the clear daylight of each
+        // hour; an hour given more than its daylight keeps its daylight and
+        // the rest goes to the others.
+        std::array<double, 24> sunshine{};
+        {
+            std::array<bool, 24> full{};
+            double left = w.sunshine_hours;
+            for (int pass = 0; pass < 24 && left > 1e-9; ++pass)
+            {
+                double clear = 0.0;
+                double spare = 0.0;
+                for (std::size_t h = 0; h < 24; ++h)
+                {
+                    if (full.at(h)) continue;
+                    clear += fenced(daylight.at(h) * (1.0 - cloud.at(h)));
+                    spare += daylight.at(h);
+                }
+                if (spare <= 0.0) break;
+                bool capped = false;
+                for (std::size_t h = 0; h < 24; ++h)
+                {
+                    if (full.at(h)) continue;
+                    const double share = clear > 0.0 ? left * fenced(daylight.at(h) * (1.0 - cloud.at(h))) / clear
+                                                     : left * daylight.at(h) / spare;
+                    if (share > daylight.at(h))
+                    {
+                        full.at(h) = true;
+                        sunshine.at(h) = daylight.at(h);
+                        left -= daylight.at(h);
+                        capped = true;
+                    }
+                }
+                if (capped) continue;
+                for (std::size_t h = 0; h < 24; ++h)
+                {
+                    if (full.at(h)) continue;
+                    sunshine.at(h) = clear > 0.0 ? left * fenced(daylight.at(h) * (1.0 - cloud.at(h))) / clear
+                                                 : left * daylight.at(h) / spare;
+                }
+                left = 0.0;
+            }
+        }
+
+        // Humidity: the day's vapour pressure against each hour's saturation.
+        const double vapour = (w.humidity / 100.0) * saturation_(w.tmean);
+
+        std::vector<weather_hour> out(24);
+        const auto midnight = std::chrono::sys_time<std::chrono::minutes>{std::chrono::sys_days{w.date}} -
+                              std::chrono::minutes{std::llround(solar)};
+        for (std::size_t h = 0; h < 24; ++h)
+        {
+            weather_hour& o = out.at(h);
+            o.hour = static_cast<int>(h);
+            o.time = midnight + std::chrono::minutes{60 * static_cast<long long>(h)};
+            const double mm = static_cast<double>(water.at(h)) / 10.0;
+            const double cm = static_cast<double>(snow.at(h)) / 10.0;
+            if (water.at(h) > 0)
+            {
+                o.type = w.type;
+                o.thunder = w.thunder;
+            }
+            o.cloud_cover = round_to_(cloud.at(h), 100.0);
+            double humidity = std::clamp(100.0 * vapour / saturation_(temperature.at(h)), 5.0, 100.0);
+            if (water.at(h) > 0) humidity = std::max(humidity, model::wet_hour_humidity);
+            o.humidity = round_to_(humidity, 1.0);
+            o.daylight_hours = round_to_(daylight.at(h), 100.0);
+            o.sunshine_hours = round_to_(sunshine.at(h), 100.0);
+            o.condition = hour_condition_(o, mm);
+            if (imperial)
+            {
+                o.temperature = round_to_(fahrenheit_(temperature.at(h)), 10.0);
+                o.precipitation = round_to_(mm / mm_per_inch, 100.0);
+                o.snowfall = round_to_(cm / (mm_per_inch / 10.0), 10.0);
+                o.wind = round_to_(wind.at(h) / metres_per_second_per_mph, 10.0);
+            }
+            else
+            {
+                o.temperature = round_to_(temperature.at(h), 10.0);
+                o.precipitation = mm;
+                o.snowfall = cm;
+                o.wind = round_to_(wind.at(h), 10.0);
+            }
+        }
+        return out;
+    }
+
+    // An hour's condition: the day's thresholds for dry hours, rates per
+    // hour (mm of water) for wet ones.
+    static weather_condition hour_condition_(const weather_hour& o, double mm)
+    {
+        switch (o.type)
+        {
+        case precipitation_type::none:
+            if (o.cloud_cover < 0.2) return weather_condition::clear;
+            if (o.cloud_cover < 0.5) return weather_condition::partly_cloudy;
+            if (o.cloud_cover < 0.85) return weather_condition::mostly_cloudy;
+            return weather_condition::overcast;
+        case precipitation_type::snow:
+            if (mm < 0.5) return weather_condition::light_snow;
+            if (mm < 2.0) return weather_condition::snow;
+            return weather_condition::heavy_snow;
+        case precipitation_type::sleet:
+            return o.thunder ? weather_condition::thunderstorm : weather_condition::sleet;
+        case precipitation_type::rain: break;
+        }
+        if (o.thunder) return weather_condition::thunderstorm;
+        if (mm < 0.5) return weather_condition::light_rain;
+        if (mm < 4.0) return weather_condition::rain;
+        return weather_condition::heavy_rain;
     }
 
     static weather_condition condition_(const weather& w)
