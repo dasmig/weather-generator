@@ -257,6 +257,19 @@ TEST_CASE("days are invariant: temperatures, precipitation and labels agree", "[
         REQUIRE(w.humidity >= 5.0);
         REQUIRE(w.humidity <= 100.0);
         REQUIRE(w.wind >= 0.0);
+        REQUIRE(w.gust >= w.wind);
+        REQUIRE(w.snow_depth >= 0.0);
+        REQUIRE(w.solar_radiation >= 0.0);
+        if (w.condition == dasmig::weather_condition::fog)
+        {
+            REQUIRE(w.fog);
+            REQUIRE(w.type == dasmig::precipitation_type::none);
+        }
+        if (w.condition == dasmig::weather_condition::drizzle)
+        {
+            REQUIRE(w.type == dasmig::precipitation_type::rain);
+            REQUIRE(w.precipitation < 2.5);
+        }
         if (w.type == dasmig::precipitation_type::none)
         {
             REQUIRE(w.precipitation == 0.0);
@@ -275,7 +288,7 @@ TEST_CASE("days are invariant: temperatures, precipitation and labels agree", "[
         }
         if (w.thunder) REQUIRE(w.condition == dasmig::weather_condition::thunderstorm);
     }
-    REQUIRE(seen.size() == 12); // every condition occurs
+    REQUIRE(seen.size() == 14); // every condition occurs
 }
 
 // ---------------------------------------------------------------------------
@@ -579,6 +592,128 @@ TEST_CASE("snow falls in a Siberian winter and never in the Amazon", "[stats]")
     }
 }
 
+TEST_CASE("snow lies through a Siberian winter, melts by summer and never lies in the Amazon", "[stats][snow]")
+{
+    const auto gen = make_loaded_generator();
+    for (std::uint64_t s = 0; s < 5; ++s)
+    {
+        // Yakutsk: snow builds from October and lies all winter.
+        REQUIRE(gen.get_weather(at(62.0, 129.7, 2001y / 3 / 1), s).snow_depth > 5.0);
+        REQUIRE(gen.get_weather(at(62.0, 129.7, 2001y / 7 / 20), s).snow_depth == 0.0);
+        // A day's snow depth does not depend on the call: the season is
+        // simulated from its start whatever day is asked for.
+        const auto series = gen.get_weather_series(at(62.0, 129.7, 2001y / 1 / 1), 90, s);
+        REQUIRE(gen.get_weather(at(62.0, 129.7, 2001y / 3 / 1), s).snow_depth == series[59].snow_depth);
+    }
+    for (const auto& w : gen.get_weather_series(at(-3.1, -60.0, 2000y / 1 / 1), 365, 2))
+    {
+        REQUIRE(w.snow_depth == 0.0);
+    }
+    // Snow depth grows with the snowfall it keeps and shrinks as it melts
+    // and settles: never more than the snow fallen since the season began.
+    double fallen = 0.0;
+    for (const auto& w : gen.get_weather_series(at(62.0, 129.7, 2000y / 7 / 15), 365, 4))
+    {
+        fallen += w.snowfall;
+        REQUIRE(w.snow_depth <= fallen + 0.05);
+    }
+}
+
+TEST_CASE("nearby places share their weather, unless spatial correlation is off", "[stats][spatial]")
+{
+    const auto gen = make_loaded_generator();
+    // Paris and Rouen (110 km apart), the same seed, two years of days.
+    const auto correlation = [&](bool spatial)
+    {
+        auto a = at(48.85, 2.35, 2001y / 1 / 1);
+        auto b = at(49.44, 1.10, 2001y / 1 / 1);
+        a.spatial = spatial;
+        b.spatial = spatial;
+        const auto x = gen.get_weather_series(a, 730, 7);
+        const auto y = gen.get_weather_series(b, 730, 7);
+        // Wet days (phi) and day-to-day changes of the mean temperature.
+        double n11 = 0.0, n10 = 0.0, n01 = 0.0, n00 = 0.0;
+        double sxy = 0.0, sxx = 0.0, syy = 0.0;
+        for (std::size_t i = 1; i < x.size(); ++i)
+        {
+            const bool wx = x[i].precipitation > 0.0;
+            const bool wy = y[i].precipitation > 0.0;
+            (wx ? (wy ? n11 : n10) : (wy ? n01 : n00)) += 1.0;
+            const double dx = x[i].tmean - x[i - 1].tmean;
+            const double dy = y[i].tmean - y[i - 1].tmean;
+            sxy += dx * dy;
+            sxx += dx * dx;
+            syy += dy * dy;
+        }
+        const double phi = ((n11 * n00) - (n10 * n01)) / std::sqrt((n11 + n10) * (n01 + n00) * (n11 + n01) * (n10 + n00));
+        return std::pair{phi, sxy / std::sqrt(sxx * syy)};
+    };
+    const auto [wet_on, t_on] = correlation(true);
+    const auto [wet_off, t_off] = correlation(false);
+    REQUIRE(wet_on > 0.35);
+    REQUIRE(t_on > 0.5);
+    REQUIRE(std::abs(wet_off) < 0.1);
+    REQUIRE(std::abs(t_off) < 0.1);
+    // Far apart (Paris and Novosibirsk), places stay independent.
+    const auto x = gen.get_weather_series(at(48.85, 2.35, 2001y / 1 / 1), 730, 7);
+    const auto y = gen.get_weather_series(at(55.0, 82.9, 2001y / 1 / 1), 730, 7);
+    double same = 0.0;
+    for (std::size_t i = 0; i < x.size(); ++i) same += ((x[i].precipitation > 0.0) == (y[i].precipitation > 0.0)) ? 1.0 : 0.0;
+    REQUIRE(same / static_cast<double>(x.size()) < 0.75);
+}
+
+TEST_CASE("fog, drizzle, gusts and solar radiation", "[stats]")
+{
+    const auto gen = make_loaded_generator();
+    int fog = 0;
+    int foggy = 0;
+    int drizzle = 0;
+    int days = 0;
+    for (const auto& w : gen.get_weather_series(at(51.5, -0.1, 2001y / 1 / 1), 3 * 365, 11))
+    {
+        ++days;
+        fog += w.fog ? 1 : 0;
+        foggy += w.condition == dasmig::weather_condition::fog ? 1 : 0;
+        drizzle += w.condition == dasmig::weather_condition::drizzle ? 1 : 0;
+        REQUIRE(w.gust >= w.wind);
+    }
+    // London: fog on some days, thick fog on fewer, drizzle on some.
+    REQUIRE(fog > days / 50);
+    REQUIRE(fog < days / 2);
+    REQUIRE(foggy > 0);
+    REQUIRE(foggy < fog);
+    REQUIRE(drizzle > 0);
+
+    // Solar radiation: a clear midsummer day in Spain gets far more than a
+    // midwinter one, and the polar night none.
+    double summer = 0.0;
+    double winter = 0.0;
+    for (std::uint64_t s = 0; s < 20; ++s)
+    {
+        summer += gen.get_weather(at(40.0, -4.0, 2023y / 6 / 21), s).solar_radiation / 20.0;
+        winter += gen.get_weather(at(40.0, -4.0, 2023y / 12 / 21), s).solar_radiation / 20.0;
+        REQUIRE(gen.get_weather(at(78.2, 15.6, 2023y / 12 / 21), s).solar_radiation == 0.0);
+    }
+    REQUIRE(summer > 20.0);
+    REQUIRE(summer < 35.0);
+    REQUIRE(winter > 3.0);
+    REQUIRE(winter < summer / 2.0);
+
+    // Hours: fog only in the hours of a foggy day.
+    for (std::uint64_t s = 0; s < 200; ++s)
+    {
+        auto r = at(51.5, -0.1, 2023y / 11 / 10);
+        r.hourly = true;
+        const auto w = gen.get_weather(r, s);
+        bool any = false;
+        for (const auto& h : w.hours)
+        {
+            any = any || h.fog;
+        }
+        REQUIRE(any == w.fog);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Conversion and JSON
 // ---------------------------------------------------------------------------
@@ -607,7 +742,7 @@ TEST_CASE("to_json and signature", "[json]")
     REQUIRE(v.seed() == 99);
     REQUIRE(v.signature().data == gen.data_hash());
     const auto json = v.to_json();
-    REQUIRE(json.starts_with(R"({"date":"2023-07-01","place":{"cell":"49.00,3.00","latitude":48.85,)"));
+    REQUIRE(json.starts_with(R"({"date":"2023-07-01","units":"metric","place":{"cell":"49.00,3.00","latitude":48.85,)"));
     REQUIRE(json.find(R"("signature":{"seed":"0000000000000063")") != std::string::npos);
 
     dasmig::core::json_writer w;
@@ -635,11 +770,11 @@ TEST_CASE("known answers for fixed seeds", "[kat]")
     REQUIRE(gen.data_hash() == 0x590a3332eb0f63a0ULL);
 
     REQUIRE(gen.get_weather(dasmig::weather_request{}, std::uint64_t{1}).to_json() ==
-            R"({"date":"2023-07-01","place":{"cell":"-17.00,-65.00","latitude":-16.998,"longitude":-65,"elevation":1060,"distance_km":0},"condition":"clear","tmin":14.8,"tmean":20.5,"tmax":26.2,"frost":false,"precipitation":0,"snowfall":0,"type":"none","thunder":false,"cloud_cover":0.18,"humidity":78,"wind":1.3,"daylight_hours":11.13,"sunshine_hours":9.1,"sunrise":"2023-07-01T10:50Z","sunset":"2023-07-01T21:58Z","signature":{"seed":"0000000000000001","data":"590a3332eb0f63a0"}})");
+            R"({"date":"2023-07-01","units":"metric","place":{"cell":"-17.00,-65.00","latitude":-16.998,"longitude":-65,"elevation":1060,"distance_km":0},"condition":"fog","tmin":13.8,"tmean":20.1,"tmax":26.5,"frost":false,"precipitation":0,"snowfall":0,"snow_depth":0,"type":"none","thunder":false,"fog":true,"cloud_cover":0.19,"humidity":78,"wind":1.3,"gust":7.7,"daylight_hours":11.13,"sunshine_hours":9.7,"solar_radiation":17.7,"sunrise":"2023-07-01T10:50Z","sunset":"2023-07-01T21:58Z","signature":{"seed":"0000000000000001","data":"590a3332eb0f63a0"}})");
     REQUIRE(gen.get_weather(at(48.85, 2.35, 2024y / 1 / 15), std::uint64_t{3}).to_json() ==
-            R"({"date":"2024-01-15","place":{"cell":"49.00,3.00","latitude":48.85,"longitude":2.35,"elevation":117,"distance_km":0},"condition":"light_rain","tmin":1.2,"tmean":3.8,"tmax":6.5,"frost":false,"precipitation":1.2,"snowfall":0,"type":"rain","thunder":false,"cloud_cover":1,"humidity":90,"wind":4.2,"daylight_hours":8.69,"sunshine_hours":0,"sunrise":"2024-01-15T07:39Z","sunset":"2024-01-15T16:21Z","signature":{"seed":"0000000000000003","data":"590a3332eb0f63a0"}})");
+            R"({"date":"2024-01-15","units":"metric","place":{"cell":"49.00,3.00","latitude":48.85,"longitude":2.35,"elevation":117,"distance_km":0},"condition":"light_rain","tmin":-0.6,"tmean":2,"tmax":4.5,"frost":true,"precipitation":1,"snowfall":0,"snow_depth":0,"type":"rain","thunder":false,"fog":true,"cloud_cover":1,"humidity":89,"wind":4.2,"gust":9.2,"daylight_hours":8.69,"sunshine_hours":0,"solar_radiation":2.4,"sunrise":"2024-01-15T07:39Z","sunset":"2024-01-15T16:21Z","signature":{"seed":"0000000000000003","data":"590a3332eb0f63a0"}})");
     REQUIRE(gen.get_weather(at(62.0, 129.7, 2024y / 2 / 29), std::uint64_t{5}).to_json() ==
-            R"({"date":"2024-02-29","place":{"cell":"63.00,129.00","latitude":62,"longitude":129.7,"elevation":171,"distance_km":0},"condition":"mostly_cloudy","tmin":-40.1,"tmean":-36.6,"tmax":-33,"frost":true,"precipitation":0,"snowfall":0,"type":"none","thunder":false,"cloud_cover":0.67,"humidity":92,"wind":1.8,"daylight_hours":10.25,"sunshine_hours":3.4,"sunrise":"2024-02-28T22:26Z","sunset":"2024-02-29T08:41Z","signature":{"seed":"0000000000000005","data":"590a3332eb0f63a0"}})");
+            R"({"date":"2024-02-29","units":"metric","place":{"cell":"63.00,129.00","latitude":62,"longitude":129.7,"elevation":171,"distance_km":0},"condition":"fog","tmin":-32.2,"tmean":-28.2,"tmax":-24.3,"frost":true,"precipitation":0,"snowfall":0,"snow_depth":16.9,"type":"none","thunder":false,"fog":true,"cloud_cover":0.69,"humidity":92,"wind":1.8,"gust":5.9,"daylight_hours":10.25,"sunshine_hours":4.9,"solar_radiation":5.5,"sunrise":"2024-02-28T22:26Z","sunset":"2024-02-29T08:41Z","signature":{"seed":"0000000000000005","data":"590a3332eb0f63a0"}})");
 
     std::uint64_t h = 0xcbf29ce484222325ULL;
     for (std::uint64_t s = 0; s < 10000; ++s)
@@ -660,7 +795,7 @@ TEST_CASE("known answers for fixed seeds", "[kat]")
             h *= 0x100000001b3ULL;
         }
     }
-    REQUIRE(h == 0xf799f8c25c34c3dfULL);
+    REQUIRE(h == 0xd6f9d63fe65c33dcULL);
 }
 
 // ---------------------------------------------------------------------------
@@ -718,8 +853,8 @@ TEST_CASE("imperial units convert the same day", "[units]")
     const auto paris = at(48.85, 2.35, 2024y / 1 / 15);
     auto imperial = paris;
     imperial.units = dasmig::unit_system::imperial;
-    // Metric JSON has no units key (it is 1.0's); imperial says so.
-    REQUIRE(gen.get_weather(paris, 3).to_json().find("\"units\"") == std::string::npos);
+    // The JSON always says its units (since 2.0).
+    REQUIRE(gen.get_weather(paris, 3).to_json().starts_with(R"({"date":"2024-01-15","units":"metric","place":)"));
     REQUIRE(gen.get_weather(imperial, 3).to_json().starts_with(R"({"date":"2024-01-15","units":"imperial","place":)"));
     REQUIRE(gen.get_weather(imperial, 3).to_string().find("°F") != std::string::npos);
     REQUIRE(dasmig::to_string(dasmig::unit_system::imperial) == "imperial");
@@ -935,7 +1070,7 @@ TEST_CASE("known answers for units, hours and historical months", "[kat]")
     r.hourly = true;
     r.units = dasmig::unit_system::imperial;
     for (const auto& w : gen.get_weather_series(r, 30, 14)) h = json_hash(h, w.to_json());
-    REQUIRE(h == 0x6fbdd2bfede1c49dULL);
+    REQUIRE(h == 0x3b94efcfdd013e22ULL);
 }
 
 // ---------------------------------------------------------------------------
@@ -1025,7 +1160,7 @@ TEST_CASE("compiled-in data needs no files and matches them", "[embed]")
     REQUIRE(gen.layers().front().source == "embedded:lite/climate.tsv");
     REQUIRE(gen.data_hash() == 0x590a3332eb0f63a0ULL); // same as the file
     REQUIRE(gen.get_weather(dasmig::weather_request{}, std::uint64_t{1}).to_json() ==
-            R"({"date":"2023-07-01","place":{"cell":"-17.00,-65.00","latitude":-16.998,"longitude":-65,"elevation":1060,"distance_km":0},"condition":"clear","tmin":14.8,"tmean":20.5,"tmax":26.2,"frost":false,"precipitation":0,"snowfall":0,"type":"none","thunder":false,"cloud_cover":0.18,"humidity":78,"wind":1.3,"daylight_hours":11.13,"sunshine_hours":9.1,"sunrise":"2023-07-01T10:50Z","sunset":"2023-07-01T21:58Z","signature":{"seed":"0000000000000001","data":"590a3332eb0f63a0"}})");
+            R"({"date":"2023-07-01","units":"metric","place":{"cell":"-17.00,-65.00","latitude":-16.998,"longitude":-65,"elevation":1060,"distance_km":0},"condition":"fog","tmin":13.8,"tmean":20.1,"tmax":26.5,"frost":false,"precipitation":0,"snowfall":0,"snow_depth":0,"type":"none","thunder":false,"fog":true,"cloud_cover":0.19,"humidity":78,"wind":1.3,"gust":7.7,"daylight_hours":11.13,"sunshine_hours":9.7,"solar_radiation":17.7,"sunrise":"2023-07-01T10:50Z","sunset":"2023-07-01T21:58Z","signature":{"seed":"0000000000000001","data":"590a3332eb0f63a0"}})");
 }
 #endif
 
@@ -1091,5 +1226,5 @@ TEST_CASE("weather batch: known answer of 10,000 items", "[batch][kat]")
     gen.for_each_weather(request, {.count = 10000, .threads = 4}, 1,
                          [&](std::uint64_t, const dasmig::weather& item)
                          { hash = dasmig::core::hash_combine(hash, dasmig::core::fnv1a64(item.to_json())); });
-    REQUIRE(hash == 0xe60669cee7842140ULL);
+    REQUIRE(hash == 0x71894cb102e53010ULL);
 }

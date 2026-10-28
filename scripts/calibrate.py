@@ -8,7 +8,7 @@ domain), 1991-2020 to match the climate table's normals:
 - rain persistence: d = P(wet | wet) - P(wet | dry), against the month's
   wet-day fraction f (then P(wet | dry) = f (1 - d), P(wet | wet) = P(wet |
   dry) + d, which keeps f);
-- the gamma shape of wet-day amounts, against the mean wet-day amount;
+- the Weibull shape of wet-day amounts, against the mean wet-day amount;
 - how much the daily mean and range of wet days differ from dry days, as a
   share of the diurnal range;
 - the day-to-day spread of the daily mean temperature and of the daily range
@@ -216,11 +216,13 @@ def fetch(ghcn, path=STATIONS):
 # -- fit ---------------------------------------------------------------------
 
 CLIMATE = HERE.parent / "resources" / "full" / "climate.tsv"
+STEMS = (("tmp", "tmean"), ("dtr", "dtr"), ("rd0", "wet_days"), ("pre", "precipitation"), ("cld", "cloud"),
+         ("reh", "humidity"), ("wnd", "wind"))
 
 
 def cru_cells(climate=CLIMATE, wanted=None):
     """{(row, col) on the 0.5-degree grid: {stem: [12 floats]}} from the full
-    tier's climate table (stems as CRU's: tmp, dtr, rd0, pre)."""
+    tier's climate table (stems as CRU's: tmp, dtr, rd0, pre, cld, reh, wnd)."""
     out = {}
     with open(climate, encoding="utf-8") as f:
         header = f.readline().rstrip("\n").split("\t")
@@ -232,7 +234,7 @@ def cru_cells(climate=CLIMATE, wanted=None):
             if wanted is not None and key not in wanted:
                 continue
             out[key] = {stem: [float(x) for x in p[col[name]].split(";")]
-                        for stem, name in (("tmp", "tmean"), ("dtr", "dtr"), ("rd0", "wet_days"), ("pre", "precipitation"))}
+                        for stem, name in STEMS}
     return out
 
 
@@ -260,10 +262,25 @@ def ordinal(date_int):
     return np.datetime64(f"{y:04d}-{m:02d}-{d:02d}").astype(int)
 
 
-def thom_shape(x):
-    """Gamma shape by Thom's (1958) approximation to the maximum likelihood."""
-    a = math.log(np.mean(x)) - np.mean(np.log(x))
-    return (1 + math.sqrt(1 + 4 * a / 3)) / (4 * a) if a > 0 else float("nan")
+def weibull_mle(x):
+    """Weibull shape by maximum likelihood: the root c of
+    sum(x^c ln x) / sum(x^c) - 1/c - mean(ln x), by bisection."""
+    lx = np.log(x)
+
+    def g(c):
+        xc = x ** c
+        return np.sum(xc * lx) / np.sum(xc) - 1 / c - lx.mean()
+
+    lo, hi = 0.1, 10.0
+    if g(lo) > 0 or g(hi) < 0:
+        return float("nan")
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        if g(mid) < 0:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2
 
 
 def harmonics(doy, k=3):
@@ -297,6 +314,15 @@ def logistic(x, y):
     return w
 
 
+def median_regression(x, y, iterations=100):
+    """Least absolute deviations by iteratively reweighted least squares."""
+    coef, *_ = np.linalg.lstsq(x, y, rcond=None)
+    for _ in range(iterations):
+        w = 1.0 / np.maximum(np.abs(y - x @ coef), 1e-4)
+        coef = np.linalg.solve((x * w[:, None]).T @ x, (x * w[:, None]).T @ y)
+    return coef
+
+
 def ols(x, y, names, label):
     x, y = np.asarray(x), np.asarray(y)
     coef, *_ = np.linalg.lstsq(x, y, rcond=None)
@@ -314,7 +340,7 @@ def fit(ghcn, climate):
     wanted = {c for _, lat, lon in st for c in near(lat, lon)}
     grid = cru_cells(climate, wanted)
 
-    occ, amt, offs, sds, spells = [], [], [], [], []
+    occ, amt, classes, sds, spells = [], [], [], [], []
     m0, m1, npairs = np.zeros((2, 2)), np.zeros((2, 2)), 0
     wind_ratio = []
     snow_t, snow_y = [], []
@@ -324,7 +350,7 @@ def fit(ghcn, climate):
         path = ghcn / "by_station" / f"{sid}.csv.gz"
         if not path.exists():
             continue
-        cell = next((grid[c] for c in near(lat, lon) if len(grid.get(c, {})) == 4), None)
+        cell = next((grid[c] for c in near(lat, lon) if len(grid.get(c, {})) == len(STEMS)), None)
         if cell is None:
             continue
         data = read_station(path)
@@ -364,6 +390,14 @@ def fit(ghcn, climate):
             r[good] = t[good] - h @ coef
             res[name] = r
 
+        # Rain classes by the day's and its neighbours' rain: 0 wet after dry,
+        # 1 wet after wet, 2 dry after wet, 3 dry before wet, 4 dry between
+        # wet days, -1 dry between dry days.
+        before, after = np.roll(wet, 1), np.roll(wet, -1)
+        cls = np.select([wet & ~before, wet & before, ~wet & before & ~after, ~wet & ~before & after,
+                         ~wet & before & after], [0, 1, 2, 3, 4], -1)
+        known = good & np.roll(good, 1) & np.roll(good, -1)
+
         z = {name: np.full(n, np.nan) for name in res}
         for m in range(12):
             sel = good & (month == m)
@@ -385,26 +419,36 @@ def fit(ghcn, climate):
             # Amounts.
             x = pr[w]
             if len(x) >= 40:
-                amt.append((np.mean(x), thom_shape(x), f))
-            # Wet/dry offsets and spread.
-            if w.sum() >= 30 and dsel.sum() >= 30:
-                dm = np.mean(res["m"][dsel]) - np.mean(res["m"][w])
-                dr = np.mean(res["r"][dsel]) - np.mean(res["r"][w])
-                offs.append((dtr_m, dm, dr, f))
+                amt.append((np.mean(x), weibull_mle(x), f))
+            # Rain classes and spread. The class shifts are against the dry
+            # days between dry days: the mean's as a share of the diurnal
+            # range, the range's as a share of that reference day's range;
+            # regressed on what the climate table has. The spreads and the
+            # residuals for A and B are what the classes leave.
+            ks = sel & known
+            base = ks & (cls == -1)
+            if base.sum() >= 30 and all((ks & (cls == k)).sum() >= 20 for k in range(5)):
+                f_cell = cell["rd0"][m] / calendar.monthrange(2001, m + 1)[1]
+                x = [1.0, season[m], f_cell, abs(lat) / 90, annual_range / 30, cell["dtr"][m] / 10,
+                     cell["cld"][m] / 100, cell["reh"][m] / 100]
+                range_base = np.mean((tx - tn)[base])
+                for k in range(5):
+                    kk = ks & (cls == k)
+                    classes.append((k, x, (np.mean(res["m"][kk]) - np.mean(res["m"][base])) / dtr_m,
+                                    (np.mean((tx - tn)[kk]) / range_base) - 1.0))
                 for name in res:
                     r = res[name]
-                    cls = np.where(wet, np.mean(r[w]), np.mean(r[dsel]))
-                    rr = r - cls
-                    sd = np.std(rr[sel])
+                    rr = np.full(n, np.nan)
+                    for k in range(-1, 5):
+                        kk = ks & (cls == k)
+                        rr[kk] = r[kk] - np.mean(r[kk])
+                    sd = np.nanstd(rr[ks])
                     if name == "m":
                         sdm = sd
                     else:
                         sdr = sd
-                    z[name][sel] = rr[sel] / sd
-                sds.append(
-                    (sdm, sdr, annual_range, cell["dtr"][m], cell["rd0"][m] / calendar.monthrange(2001, m + 1)[1],
-                     season[m], abs(lat))
-                )
+                    z[name][ks] = rr[ks] / sd
+                sds.append((sdm, sdr, annual_range, cell["dtr"][m], f_cell, season[m], abs(lat)))
             # Thunder on wet days, at the US stations (whose reports are
             # consistent; elsewhere WT03 is sparse).
             if sid.startswith("US") and np.nansum(arr["WT03"]) >= 100:
@@ -447,16 +491,23 @@ def fit(ghcn, climate):
 
     # Gamma shape against the mean wet-day amount.
     amt = np.array([a for a in amt if np.isfinite(a[1])])
-    ols(np.stack([np.ones(len(amt)), np.log(amt[:, 0])], axis=1), amt[:, 1], ["1", "ln(mean)"], "gamma shape")
+    ols(np.stack([np.ones(len(amt)), np.log(amt[:, 0])], axis=1), amt[:, 1], ["1", "ln(mean)"], "Weibull shape")
     print(f"  median shape = {np.median(amt[:, 1]):.3f}, 10-90% {np.percentile(amt[:, 1], 10):.3f}-"
           f"{np.percentile(amt[:, 1], 90):.3f}")
 
-    # Wet/dry offsets as shares of the diurnal range (the median over the
-    # station-months; a regression through the origin understates them).
-    offs = np.array(offs)
-    km = np.median(offs[:, 1] / offs[:, 0])
-    kr = np.median(offs[:, 2] / offs[:, 0])
-    print(f"\nwet/dry offsets (dry minus wet) = k * dtr: k_mean = {km:.4f}, k_range = {kr:.4f} (n = {len(offs)})")
+    # Rain-class shifts: least squares, so the shifts are right on average
+    # (a median regression leaves the winter months' large positive shifts
+    # out, and wet days come out too cold against dry ones).
+    labels = ["wet after dry", "wet after wet", "dry after wet", "dry before wet", "dry between wet"]
+    for col, what in ((2, "mean shift, share of dtr"), (3, "range factor - 1")):
+        print(f"\nrain classes, {what}: c . (1, season, f, |lat|/90, annual range/30, dtr/10, cloud, humidity)")
+        for k in range(5):
+            rows = [c for c in classes if c[0] == k]
+            x = np.array([c[1] for c in rows])
+            y = np.array([c[col] for c in rows])
+            coef, *_ = np.linalg.lstsq(x, y, rcond=None)
+            print(f"  {labels[k]:>16} (n = {len(y)}, median {np.median(y):+.3f}): {{" +
+                  ", ".join(f"{c:.4f}" for c in coef) + "}")
 
     # Spread.
     sds = np.array(sds)
