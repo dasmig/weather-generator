@@ -26,9 +26,9 @@ static std::filesystem::path lite_dir()
     return {};
 }
 
-static dasmig::wthg make_loaded_generator()
+static dasmig::wtg make_loaded_generator()
 {
-    dasmig::wthg gen;
+    dasmig::wtg gen;
     if (!gen.load(dasmig::dataset::lite)) gen.load(lite_dir());
     REQUIRE(gen.has_data());
     return gen;
@@ -98,7 +98,7 @@ static std::string station_row(const std::string& key, double lat, double lon, d
 }
 
 static const std::string header = "key\tlatitude\tlongitude\televation\tarea\ttmean\tdtr\tprecipitation\twet_days\t"
-                                  "humidity\tsunshine\twind\n";
+                                  "humidity\tcloud\twind\n";
 
 // ---------------------------------------------------------------------------
 // Loading
@@ -107,13 +107,13 @@ static const std::string header = "key\tlatitude\tlongitude\televation\tarea\ttm
 TEST_CASE("load(dataset::lite) loads the climate grid", "[loading]")
 {
     const auto gen = make_loaded_generator();
-    REQUIRE(gen.count() == 5043);
+    REQUIRE(gen.count() == 5163);
     REQUIRE(gen.layers().size() == 1);
 }
 
 TEST_CASE("load - non-existent path is a no-op", "[loading]")
 {
-    dasmig::wthg gen;
+    dasmig::wtg gen;
     gen.load(std::filesystem::path{"no/such/directory"});
     REQUIRE_FALSE(gen.has_data());
     REQUIRE(gen.data_hash() == 0);
@@ -123,10 +123,10 @@ TEST_CASE("load - non-existent path is a no-op", "[loading]")
 TEST_CASE("load(dataset) returns false for a missing tier", "[loading]")
 {
     const auto old_cwd = std::filesystem::current_path();
-    const auto tmp = std::filesystem::temp_directory_path() / "wthg_empty_dir";
+    const auto tmp = std::filesystem::temp_directory_path() / "wtg_empty_dir";
     std::filesystem::create_directories(tmp);
     std::filesystem::current_path(tmp);
-    dasmig::wthg gen;
+    dasmig::wtg gen;
     const bool loaded = gen.load(dasmig::dataset::full);
     std::filesystem::current_path(old_cwd);
     std::filesystem::remove_all(tmp);
@@ -137,7 +137,7 @@ TEST_CASE("load(dataset) returns false for a missing tier", "[loading]")
 
 TEST_CASE("the singleton loads data on first use", "[loading]")
 {
-    REQUIRE(dasmig::wthg::instance().has_data());
+    REQUIRE(dasmig::wtg::instance().has_data());
 }
 
 // ---------------------------------------------------------------------------
@@ -146,7 +146,7 @@ TEST_CASE("the singleton loads data on first use", "[loading]")
 
 TEST_CASE("get_weather throws when no data is loaded", "[generation]")
 {
-    dasmig::wthg gen;
+    dasmig::wtg gen;
     REQUIRE_THROWS_AS(gen.get_weather(dasmig::weather_request{}), std::runtime_error);
     REQUIRE_THROWS_AS(gen.get_weather(dasmig::weather_request{}, std::uint64_t{1}), std::runtime_error);
     REQUIRE_THROWS_AS(gen.get_weather_series(dasmig::weather_request{}, 3, 1), std::runtime_error);
@@ -202,7 +202,7 @@ TEST_CASE("invalid requests are rejected", "[generation][errors]")
     r.warming = 11.0;
     REQUIRE_THROWS_AS(gen.get_weather(r, 1), std::invalid_argument);
     REQUIRE_THROWS_AS(gen.get_weather_series(at(0, 0), 0, 1), std::invalid_argument);
-    REQUIRE_THROWS_AS(gen.get_weather_series(at(0, 0), dasmig::wthg::max_series_days + 1, 1),
+    REQUIRE_THROWS_AS(gen.get_weather_series(at(0, 0), dasmig::wtg::max_series_days + 1, 1),
                       std::invalid_argument);
     REQUIRE_THROWS_AS((void)gen.climate_at(-90.5, 0), std::invalid_argument);
 }
@@ -243,7 +243,13 @@ TEST_CASE("days are invariant: temperatures, precipitation and labels agree", "[
         r.date = std::chrono::year_month_day{std::chrono::sys_days{2023y / 1 / 1} + std::chrono::days{s % 365}};
         const auto w = gen.get_weather(r, s);
         seen.insert(w.condition);
-        REQUIRE(w.tmin <= w.tmax);
+        REQUIRE(w.tmin <= w.tmean);
+        REQUIRE(w.tmean <= w.tmax);
+        REQUIRE(w.frost == (w.tmin < 0.0));
+        REQUIRE(w.daylight_hours >= 0.0);
+        REQUIRE(w.daylight_hours <= 24.0);
+        REQUIRE(w.sunshine_hours >= 0.0);
+        REQUIRE(w.sunshine_hours <= w.daylight_hours + 0.05);
         REQUIRE(w.cloud_cover >= 0.0);
         REQUIRE(w.cloud_cover <= 1.0);
         REQUIRE(w.humidity >= 5.0);
@@ -284,14 +290,60 @@ TEST_CASE("a point uses the nearest cell", "[place]")
     {
         const double lat = dasmig::core::uniform_real(r, -60.0, 80.0);
         const double lon = dasmig::core::uniform_real(r, -180.0, 180.0);
-        const auto c = gen.climate_at(lat, lon);
         double best = 10.0;
         for (const auto& cell : cells) best = std::min(best, great_circle(lat, lon, cell.lat, cell.lon));
+        dasmig::climate_normals c;
+        try
+        {
+            c = gen.climate_at(lat, lon);
+        }
+        catch (const std::invalid_argument&)
+        {
+            continue; // at sea: the sea rule has its own test
+        }
         REQUIRE(great_circle(lat, lon, c.latitude, c.longitude) == Catch::Approx(best).margin(1e-9));
     }
     // Paris is in the 2-degree block centred at 49, 3; the dateline wraps.
     REQUIRE(gen.climate_at(48.85, 2.35).cell == "49.00,3.00");
     REQUIRE(gen.climate_at(-17.0, 179.99).cell == gen.climate_at(-17.0, -179.99).cell);
+}
+
+TEST_CASE("points at sea are refused beyond 100 km from land", "[place][errors]")
+{
+    const auto gen = make_loaded_generator();
+    REQUIRE(gen.get_weather(at(48.85, 2.35), 1).distance_km == 0.0); // Paris
+    REQUIRE_THROWS_AS(gen.get_weather(at(0.0, -140.0), 1), std::invalid_argument); // the Pacific
+    REQUIRE_THROWS_AS(gen.get_weather(at(40.0, -40.0), 1), std::invalid_argument);  // the Atlantic
+    REQUIRE_THROWS_AS(gen.get_weather(at(-80.0, 0.0), 1), std::invalid_argument);  // Antarctica
+    REQUIRE_THROWS_AS((void)gen.climate_at(0.0, -140.0), std::invalid_argument);
+    // The Bay of Biscay off the French coast (15 km from the mask's
+    // 0.5-degree land cells): weather of the nearest cell, with the distance.
+    const auto off = gen.get_weather(at(46.0, -2.2), 1);
+    REQUIRE(off.distance_km > 0.0);
+    REQUIRE(off.distance_km <= 100.0);
+    // Distance grows westward into the bay, then the point is refused, and
+    // stays refused.
+    double previous = 0.0;
+    bool refused = false;
+    for (double lon = -1.3; lon > -6.0; lon -= 0.1)
+    {
+        try
+        {
+            const double d = gen.get_weather(at(46.0, lon), 1).distance_km;
+            REQUIRE_FALSE(refused);
+            REQUIRE(d >= previous);
+            REQUIRE(d <= 100.0);
+            previous = d;
+        }
+        catch (const std::invalid_argument&)
+        {
+            refused = true;
+        }
+    }
+    REQUIRE(refused);
+    REQUIRE(previous > 80.0);
+    // A drawn place is always on land.
+    for (std::uint64_t s = 0; s < 300; ++s) REQUIRE(gen.get_weather({}, s).distance_km == 0.0);
 }
 
 TEST_CASE("a requested point is reported, a drawn place is a cell's", "[place]")
@@ -358,6 +410,107 @@ TEST_CASE("elevation and warming shift the temperatures", "[place]")
 }
 
 // ---------------------------------------------------------------------------
+// The sun
+// ---------------------------------------------------------------------------
+
+// NOAA's equations again in plain double arithmetic with std::sin and
+// std::acos, as the reference for the library's own trigonometry.
+static std::pair<double, double> reference_sun(std::chrono::sys_days day, double lat, double lon)
+{
+    constexpr double rad = std::numbers::pi / 180.0;
+    const auto sin_d = [&](double x) { return std::sin(x * rad); };
+    const auto cos_d = [&](double x) { return std::cos(x * rad); };
+    const double jd = static_cast<double>(day.time_since_epoch().count()) + 2440587.5 + 0.5 - (lon / 360.0);
+    const double t = (jd - 2451545.0) / 36525.0;
+    const double l0 = std::fmod(280.46646 + (t * (36000.76983 + (t * 0.0003032))), 360.0);
+    const double m = 357.52911 + (t * (35999.05029 - (0.0001537 * t)));
+    const double e = 0.016708634 - (t * (0.000042037 + (0.0000001267 * t)));
+    const double c = (sin_d(m) * (1.914602 - (t * (0.004817 + (0.000014 * t))))) +
+                     (sin_d(2 * m) * (0.019993 - (0.000101 * t))) + (sin_d(3 * m) * 0.000289);
+    const double omega = 125.04 - (1934.136 * t);
+    const double lambda = l0 + c - 0.00569 - (0.00478 * sin_d(omega));
+    const double eps0 = 23.0 + ((26.0 + ((21.448 - (t * (46.815 + (t * (0.00059 - (t * 0.001813)))))) / 60.0)) / 60.0);
+    const double eps = eps0 + (0.00256 * cos_d(omega));
+    const double decl = std::asin(sin_d(eps) * sin_d(lambda)) / rad;
+    const double y = std::pow(std::tan(eps / 2 * rad), 2);
+    const double eq = 4.0 / rad *
+                      ((y * sin_d(2 * l0)) - (2 * e * sin_d(m)) + (4 * e * y * sin_d(m) * cos_d(2 * l0)) -
+                       (0.5 * y * y * sin_d(4 * l0)) - (1.25 * e * e * sin_d(2 * m)));
+    const double ha = std::acos((cos_d(90.833) / (cos_d(lat) * cos_d(decl))) - (std::tan(lat * rad) * std::tan(decl * rad))) / rad;
+    const double noon = 720.0 - (4.0 * lon) - eq;
+    return {noon - (4 * ha), noon + (4 * ha)};
+}
+
+static double minutes_after(const std::chrono::sys_time<std::chrono::minutes>& t, std::chrono::sys_days day)
+{
+    return static_cast<double>((t - std::chrono::sys_time<std::chrono::minutes>{day}).count());
+}
+
+TEST_CASE("sunrise and sunset follow NOAA's equations", "[sun]")
+{
+    const auto gen = make_loaded_generator();
+    // Paris on 1 July 2023: 05:51 and 21:58 summer time.
+    const auto paris = gen.get_weather(at(48.85, 2.35, 2023y / 7 / 1), 1);
+    REQUIRE(paris.sunrise.has_value());
+    REQUIRE(dasmig::weather::time_string(*paris.sunrise) == "2023-07-01T03:51Z");
+    REQUIRE(dasmig::weather::time_string(*paris.sunset) == "2023-07-01T19:58Z");
+    REQUIRE(paris.daylight_hours == Catch::Approx(16.11).margin(0.02));
+    // Sydney on 1 January 2023: 05:47 local, the day before in UTC.
+    const auto sydney = gen.get_weather(at(-33.87, 151.21, 2023y / 1 / 1), 1);
+    REQUIRE(dasmig::weather::time_string(*sydney.sunrise).starts_with("2022-12-31T18:4"));
+
+    dasmig::core::rng r{8};
+    int checked = 0;
+    for (int i = 0; i < 2000; ++i)
+    {
+        const double lat = dasmig::core::uniform_real(r, -55.0, 70.0);
+        const double lon = dasmig::core::uniform_real(r, -180.0, 180.0);
+        const auto day = std::chrono::sys_days{2000y / 1 / 1} + std::chrono::days{dasmig::core::uniform_int(r, 0, 20000)};
+        dasmig::weather w;
+        try
+        {
+            w = gen.get_weather(at(lat, lon, std::chrono::year_month_day{day}), 1);
+        }
+        catch (const std::invalid_argument&)
+        {
+            continue;
+        }
+        const auto [rise, set] = reference_sun(day, lat, lon);
+        INFO(lat << ", " << lon << " day " << day.time_since_epoch().count());
+        if (std::isnan(rise))
+        {
+            REQUIRE_FALSE(w.sunrise.has_value());
+            continue;
+        }
+        REQUIRE(w.sunrise.has_value());
+        REQUIRE(minutes_after(*w.sunrise, day) == Catch::Approx(rise).margin(0.51));
+        REQUIRE(minutes_after(*w.sunset, day) == Catch::Approx(set).margin(0.51));
+        REQUIRE(w.daylight_hours == Catch::Approx((set - rise) / 60.0).margin(0.006));
+        ++checked;
+    }
+    REQUIRE(checked > 500);
+}
+
+TEST_CASE("polar day and polar night", "[sun]")
+{
+    const auto gen = make_loaded_generator();
+    const auto summer = gen.get_weather(at(69.65, 18.96, 2023y / 6 / 21), 1); // Tromsø
+    REQUIRE(summer.daylight_hours == 24.0);
+    REQUIRE_FALSE(summer.sunrise.has_value());
+    REQUIRE_FALSE(summer.sunset.has_value());
+    const auto winter = gen.get_weather(at(69.65, 18.96, 2023y / 12 / 21), 1);
+    REQUIRE(winter.daylight_hours == 0.0);
+    REQUIRE(winter.sunshine_hours == 0.0);
+    REQUIRE_FALSE(winter.sunrise.has_value());
+    REQUIRE(winter.to_json().find(R"("sunrise":null,"sunset":null)") != std::string::npos);
+    // Near the equator a day is about 12 hours all year.
+    for (const auto& d : gen.get_weather_series(at(-0.2, -78.5, 2023y / 1 / 1), 365, 1)) // Quito
+    {
+        REQUIRE(d.daylight_hours == Catch::Approx(12.1).margin(0.1));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Climate statistics: 30 generated years against the cell's normals
 // ---------------------------------------------------------------------------
 
@@ -372,7 +525,7 @@ TEST_CASE("generated years follow the normals", "[stats]")
         std::array<double, 12> tmax{}, tmin{}, total{}, wet{}, n{};
         for (const std::uint64_t seed : {11U, 12U}) // 60 years
         {
-            for (const auto& w : gen.get_weather_series(at(lat, lon, 1961y / 1 / 1), 30 * 365 + 7, seed))
+            for (const auto& w : gen.get_weather_series(at(lat, lon, 1991y / 1 / 1), 30 * 365 + 7, seed))
             {
                 const auto m = static_cast<std::size_t>(month_of(w));
                 tmax[m] += w.tmax;
@@ -474,17 +627,17 @@ TEST_CASE("to_json and signature", "[json]")
 
 TEST_CASE("known answers for fixed seeds", "[kat]")
 {
-    dasmig::wthg gen;
+    dasmig::wtg gen;
     gen.load(lite_dir());
     REQUIRE(gen.has_data());
-    REQUIRE(gen.data_hash() == 0x74fdb50d249dd970ULL);
+    REQUIRE(gen.data_hash() == 0x590a3332eb0f63a0ULL);
 
     REQUIRE(gen.get_weather(dasmig::weather_request{}, std::uint64_t{1}).to_json() ==
-            R"({"date":"2023-07-01","place":{"cell":"-17.00,-61.00","latitude":-16.998,"longitude":-61,"elevation":344},"condition":"clear","tmin":15.3,"tmax":26.1,"precipitation":0,"snowfall":0,"type":"none","thunder":false,"cloud_cover":0.17,"humidity":62,"wind":4.9,"signature":{"seed":"0000000000000001","data":"74fdb50d249dd970"}})");
+            R"({"date":"2023-07-01","place":{"cell":"-17.00,-65.00","latitude":-16.998,"longitude":-65,"elevation":1060,"distance_km":0},"condition":"clear","tmin":14.8,"tmean":20.5,"tmax":26.2,"frost":false,"precipitation":0,"snowfall":0,"type":"none","thunder":false,"cloud_cover":0.18,"humidity":78,"wind":1.3,"daylight_hours":11.13,"sunshine_hours":9.1,"sunrise":"2023-07-01T10:50Z","sunset":"2023-07-01T21:58Z","signature":{"seed":"0000000000000001","data":"590a3332eb0f63a0"}})");
     REQUIRE(gen.get_weather(at(48.85, 2.35, 2024y / 1 / 15), std::uint64_t{3}).to_json() ==
-            R"({"date":"2024-01-15","place":{"cell":"49.00,3.00","latitude":48.85,"longitude":2.35,"elevation":117},"condition":"sleet","tmin":-0.4,"tmax":4.8,"precipitation":1.1,"snowfall":0.6,"type":"sleet","thunder":false,"cloud_cover":1,"humidity":92,"wind":4.2,"signature":{"seed":"0000000000000003","data":"74fdb50d249dd970"}})");
+            R"({"date":"2024-01-15","place":{"cell":"49.00,3.00","latitude":48.85,"longitude":2.35,"elevation":117,"distance_km":0},"condition":"light_rain","tmin":1.2,"tmean":3.8,"tmax":6.5,"frost":false,"precipitation":1.2,"snowfall":0,"type":"rain","thunder":false,"cloud_cover":1,"humidity":90,"wind":4.2,"daylight_hours":8.69,"sunshine_hours":0,"sunrise":"2024-01-15T07:39Z","sunset":"2024-01-15T16:21Z","signature":{"seed":"0000000000000003","data":"590a3332eb0f63a0"}})");
     REQUIRE(gen.get_weather(at(62.0, 129.7, 2024y / 2 / 29), std::uint64_t{5}).to_json() ==
-            R"({"date":"2024-02-29","place":{"cell":"63.00,129.00","latitude":62,"longitude":129.7,"elevation":171},"condition":"partly_cloudy","tmin":-42.7,"tmax":-35,"precipitation":0,"snowfall":0,"type":"none","thunder":false,"cloud_cover":0.44,"humidity":86,"wind":1.8,"signature":{"seed":"0000000000000005","data":"74fdb50d249dd970"}})");
+            R"({"date":"2024-02-29","place":{"cell":"63.00,129.00","latitude":62,"longitude":129.7,"elevation":171,"distance_km":0},"condition":"mostly_cloudy","tmin":-40.1,"tmean":-36.6,"tmax":-33,"frost":true,"precipitation":0,"snowfall":0,"type":"none","thunder":false,"cloud_cover":0.67,"humidity":92,"wind":1.8,"daylight_hours":10.25,"sunshine_hours":3.4,"sunrise":"2024-02-28T22:26Z","sunset":"2024-02-29T08:41Z","signature":{"seed":"0000000000000005","data":"590a3332eb0f63a0"}})");
 
     std::uint64_t h = 0xcbf29ce484222325ULL;
     for (std::uint64_t s = 0; s < 10000; ++s)
@@ -505,7 +658,7 @@ TEST_CASE("known answers for fixed seeds", "[kat]")
             h *= 0x100000001b3ULL;
         }
     }
-    REQUIRE(h == 0x5bf62d009a06bce5ULL);
+    REQUIRE(h == 0xf799f8c25c34c3dfULL);
 }
 
 // ---------------------------------------------------------------------------
@@ -583,19 +736,19 @@ TEST_CASE("a bad layer is rejected and leaves the data unchanged", "[extend][err
 TEST_CASE("compiled-in data needs no files and matches them", "[embed]")
 {
     const auto old_cwd = std::filesystem::current_path();
-    const auto tmp = std::filesystem::temp_directory_path() / "wthg_embed_dir";
+    const auto tmp = std::filesystem::temp_directory_path() / "wtg_embed_dir";
     std::filesystem::create_directories(tmp);
     std::filesystem::current_path(tmp);
-    dasmig::wthg gen;
+    dasmig::wtg gen;
     const bool loaded = gen.load(dasmig::dataset::lite);
     std::filesystem::current_path(old_cwd);
     std::filesystem::remove_all(tmp);
 
     REQUIRE(loaded);
     REQUIRE(gen.layers().front().source == "embedded:lite/climate.tsv");
-    REQUIRE(gen.data_hash() == 0x74fdb50d249dd970ULL); // same as the file
+    REQUIRE(gen.data_hash() == 0x590a3332eb0f63a0ULL); // same as the file
     REQUIRE(gen.get_weather(dasmig::weather_request{}, std::uint64_t{1}).to_json() ==
-            R"({"date":"2023-07-01","place":{"cell":"-17.00,-61.00","latitude":-16.998,"longitude":-61,"elevation":344},"condition":"clear","tmin":15.3,"tmax":26.1,"precipitation":0,"snowfall":0,"type":"none","thunder":false,"cloud_cover":0.17,"humidity":62,"wind":4.9,"signature":{"seed":"0000000000000001","data":"74fdb50d249dd970"}})");
+            R"({"date":"2023-07-01","place":{"cell":"-17.00,-65.00","latitude":-16.998,"longitude":-65,"elevation":1060,"distance_km":0},"condition":"clear","tmin":14.8,"tmean":20.5,"tmax":26.2,"frost":false,"precipitation":0,"snowfall":0,"type":"none","thunder":false,"cloud_cover":0.18,"humidity":78,"wind":1.3,"daylight_hours":11.13,"sunshine_hours":9.1,"sunrise":"2023-07-01T10:50Z","sunset":"2023-07-01T21:58Z","signature":{"seed":"0000000000000001","data":"590a3332eb0f63a0"}})");
 }
 #endif
 
@@ -661,5 +814,5 @@ TEST_CASE("weather batch: known answer of 10,000 items", "[batch][kat]")
     gen.for_each_weather(request, {.count = 10000, .threads = 4}, 1,
                          [&](std::uint64_t, const dasmig::weather& item)
                          { hash = dasmig::core::hash_combine(hash, dasmig::core::fnv1a64(item.to_json())); });
-    REQUIRE(hash == 0x4a6380cad2bcd9e0ULL);
+    REQUIRE(hash == 0xe60669cee7842140ULL);
 }

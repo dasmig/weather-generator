@@ -1,17 +1,21 @@
-"""Compare generated weather with GHCN-Daily observations, 1961-1990.
+"""Compare generated weather with GHCN-Daily observations, 1991-2020.
 
-For each calibration station (scripts/ghcn_stations.txt) and month, the
+For each station of a list (scripts/ghcn_holdout.txt, which the fit never
+sees, or the calibration stations, scripts/ghcn_stations.txt) and month, the
 statistics the model is meant to reproduce are computed on the station's
 days and on 30 generated years at the same point and elevation, and the
-differences are summarized over all station-months. Where the CRU cell
+differences are summarized over all station-months. Where the climate cell
 holds the same statistic (mean Tmax and Tmin, wet days, precipitation),
 the generated value is also compared with the cell, which separates the
 model's error from the error of the normals at the station.
 
 Usage:
-  python scripts/validate.py stations GHCN_DIR OUT.tsv   # the sampler's input
-  build/sample_weather full OUT.tsv SAMPLE.tsv           # scripts/sample_weather.cpp
-  python scripts/validate.py compare GHCN_DIR CRU_DIR SAMPLE.tsv
+  python scripts/validate.py stations GHCN_DIR OUT.tsv [--list FILE]   # the sampler's input
+  build/sample_weather full OUT.tsv SAMPLE.tsv                         # scripts/sample_weather.cpp
+  python scripts/validate.py compare GHCN_DIR CLIMATE SAMPLE.tsv [--list FILE]
+
+--list defaults to the calibration stations; CLIMATE is the full tier's
+climate.tsv.
 """
 
 import argparse
@@ -25,13 +29,35 @@ import numpy as np
 import calibrate as cal
 
 
-def stations_cmd(ghcn, out):
+LAPSE = 0.0065  # degrees C per metre, as the library's
+
+
+def station_elevations(ghcn):
+    """{station id: elevation in m, -999.9 where unknown}."""
     elev = {}
     with open(ghcn / "ghcnd-stations.txt", encoding="ascii", errors="replace") as f:
         for line in f:
             elev[line[0:11]] = float(line[31:37])
+    return elev
+
+
+def cell_elevations(climate):
+    """{(row, col) on the 0.5-degree grid: the cell's mean elevation, m}."""
+    out = {}
+    with open(climate, encoding="utf-8") as f:
+        header = f.readline().rstrip("\n").split("\t")
+        key, elevation = header.index("key"), header.index("elevation")
+        for line in f:
+            p = line.rstrip("\n").split("\t")
+            lat, lon = (float(x) for x in p[key].split(","))
+            out[(int((lat + 90.0) * 2), int((lon + 180.0) * 2))] = float(p[elevation])
+    return out
+
+
+def stations_cmd(ghcn, out, path):
+    elev = station_elevations(ghcn)
     with open(out, "w", encoding="ascii", newline="\n") as f:
-        for sid, lat, lon in cal.stations():
+        for sid, lat, lon in cal.stations(path):
             e = elev.get(sid, -999.9)
             f.write(f"{sid}\t{lat}\t{lon}\t{e if e > -999 else -999}\n")
     print(f"wrote {out}")
@@ -155,15 +181,17 @@ def stats(d, n):
     return out
 
 
-def compare_cmd(ghcn, cru, sample):
+def compare_cmd(ghcn, climate, sample, path):
     gen_rows = defaultdict(list)
     with open(sample, encoding="ascii") as f:
         for line in f:
             sid, date, tx, tn, pr, typ, th, *_ = line.rstrip("\n").split("\t")
             gen_rows[sid].append((int(date.replace("-", "")), float(tx), float(tn), float(pr), typ, th == "1"))
-    st = {sid: (lat, lon) for sid, lat, lon in cal.stations()}
+    st = {sid: (lat, lon) for sid, lat, lon in cal.stations(path)}
     wanted = {c for lat, lon in st.values() for c in cal.near(lat, lon)}
-    grid = cal.cru_cells(cru, wanted)
+    grid = cal.cru_cells(climate, wanted)
+    cell_elev = cell_elevations(climate)
+    station_elev = station_elevations(ghcn)
     n = cal.ordinal(cal.LAST * 10000 + 1231) - cal.ordinal(cal.FIRST * 10000 + 101) + 1
 
     diffs = defaultdict(list)
@@ -179,7 +207,12 @@ def compare_cmd(ghcn, cru, sample):
             continue
         used += 1
         lat, lon = st[sid]
-        cell = next((grid[c] for c in cal.near(lat, lon) if len(grid.get(c, {})) == 4), None)
+        key = next((c for c in cal.near(lat, lon) if len(grid.get(c, {})) == 4), None)
+        cell = grid[key] if key is not None else None
+        # The cell's temperatures moved to the station's elevation, as the
+        # generated days are, so the comparison measures the model only.
+        e = station_elev.get(sid, -999.9)
+        lapse = LAPSE * (cell_elev[key] - e) if cell is not None and e > -999 else 0.0
         for m, s in so.items():
             for k, v in s.items():
                 if m in sg and k in sg[m]:
@@ -188,15 +221,15 @@ def compare_cmd(ghcn, cru, sample):
             if cell is not None and m != "year" and m in sg:
                 ml = calendar.monthrange(2001, m + 1)[1]
                 c = {
-                    "tmax": cell["tmp"][m] + cell["dtr"][m] / 2,
-                    "tmin": cell["tmp"][m] - cell["dtr"][m] / 2,
+                    "tmax": cell["tmp"][m] + cell["dtr"][m] / 2 + lapse,
+                    "tmin": cell["tmp"][m] - cell["dtr"][m] / 2 + lapse,
                     "wet": cell["rd0"][m] / ml,
                     "total": cell["pre"][m],
                 }
                 for k, v in c.items():
                     vs_cru[k].append(sg[m][k] - v)
     print(f"stations: {used}")
-    print(f"{'metric':>12} {'n':>6} {'obs median':>11} {'bias':>8} {'median |err|':>13}   vs CRU cell: bias, median |err|")
+    print(f"{'metric':>12} {'n':>6} {'obs median':>11} {'bias':>8} {'median |err|':>13}   vs cell: bias, median |err|")
     for k in diffs:
         d = np.array(diffs[k])
         o = np.array(obs_vals[k])
@@ -211,11 +244,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("command", choices=["stations", "compare"])
     ap.add_argument("args", nargs="+", type=Path)
+    ap.add_argument("--list", type=Path, default=cal.STATIONS, help="station list")
     a = ap.parse_args()
     if a.command == "stations":
-        stations_cmd(*a.args)
+        stations_cmd(*a.args, a.list)
     else:
-        compare_cmd(*a.args)
+        compare_cmd(*a.args, a.list)
 
 
 if __name__ == "__main__":

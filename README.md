@@ -13,26 +13,28 @@
 
 **[API Reference](https://dasmig.github.io/weather-generator/)** · **[Usage Guide](doc/usage.md)** · **[Data and Method](doc/data.md)** · **[Releases](https://github.com/dasmig/weather-generator/releases)**
 
-Daily weather for any place on land and any date: the low and the high, rain or snow and how much, thunder, cloud, humidity and wind, drawn around the place's climate normals so that thirty generated years look like thirty real ones.
+Daily weather for any place on land and any date: the low and the high, rain or snow and how much, thunder, cloud, humidity, wind, sunrise, sunset and hours of sunshine, drawn around the place's 1991-2020 climate normals so that thirty generated years look like thirty real ones.
 
 ```
-2024-01-15: rain, 5.4 to 7.9 °C, 3.0 mm
-2024-01-16: sleet, 3.9 to 8.7 °C, 0.1 cm of snow
-2024-01-17: light rain, 5.3 to 7.2 °C, 1.2 mm
-2024-01-18: mostly cloudy, 2.4 to 7.8 °C
+2024-01-15: rain, 6.8 to 9.4 °C, 2.8 mm
+2024-01-16: light rain, 5.4 to 10.2 °C, 0.3 mm
+2024-01-17: light rain, 6.7 to 8.7 °C, 1.2 mm
+2024-01-18: mostly cloudy, 4.1 to 9.4 °C
 ```
 
 ## Features
 
-- **Any Place, Any Date**. Give a latitude and longitude (or leave them out for a place drawn by land area) and any date. The climate comes from the CRU CL 2.0 normals of the nearest cell: a 2-degree grid in `lite`, half a degree in `full`. An elevation moves temperatures by the standard lapse rate, and `warming` shifts them for a warmer climate than the 1961-1990 normals.
+- **Any Place, Any Date**. Give a latitude and longitude (or leave them out for a place drawn by land area) and any date. The climate comes from the CRU TS 1991-2020 normals of the nearest cell: a 2-degree grid in `lite`, half a degree in `full`. A point off the coast takes the nearest land's weather up to 100 km out, and reports how far it is. An elevation moves temperatures by the standard lapse rate, and `warming` shifts them for a warmer climate than the normals'.
 
-- **Weather That Behaves Like Weather**. Wet days cluster, warm spells last, and some months run wet or cold: a Richardson-type weather generator (a rain Markov chain, gamma-distributed amounts, autocorrelated daily mean and range, month-to-month anomalies), fitted on 176 GHCN-Daily stations and checked against 191. Monthly means, wet days, wet-day amounts, day-to-day spread and year-to-year spread land within a few percent of the stations (see [Data and Method](doc/data.md)).
+- **Weather That Behaves Like Weather**. Wet days cluster, warm spells last, and some months run wet or cold: a Richardson-type weather generator (a rain Markov chain, gamma-distributed amounts, autocorrelated daily mean and range, month-to-month anomalies), fitted on 162 GHCN-Daily stations and checked against 120 others it never saw. Monthly means, wet days, wet-day amounts, day-to-day spread and year-to-year spread land within a few percent of those stations (see [Data and Method](doc/data.md)).
 
 - **Series That Agree**. A day's weather depends only on the seed, the place and the date, so the weather of 10 March is the same whether it is asked for alone or inside a series that starts in January, and overlapping series agree.
 
-- **Rain, Snow, Sleet and Thunder**. The form of precipitation follows the day's temperature, and thunder its heat and rain, both fitted on station records. Twelve conditions from `clear` to `heavy_snow` and `thunderstorm`.
+- **Rain, Snow, Sleet and Thunder**. The form of precipitation follows the day's temperature, and thunder its heat and rain, both fitted on station records. Twelve conditions from `clear` to `heavy_snow` and `thunderstorm`, and frost on days below 0 °C.
 
-- **Climate Normals Too**. `climate_at(lat, lon)` returns the monthly normals a place's weather is drawn around: temperature, diurnal range, precipitation, wet days, humidity, sunshine and wind.
+- **The Sun**. Sunrise, sunset and day length from NOAA's solar equations, polar day and night included, and the hours of sunshine the day's cloud lets through.
+
+- **Climate Normals Too**. `climate_at(lat, lon)` returns the monthly normals a place's weather is drawn around: temperature, diurnal range, precipitation, wet days, humidity, cloud and wind.
 
 - **Deterministic Seeding**. Per-call `get_weather(request, seed)` for reproducible results, and `weather::seed()` for replaying a previous generation with the same request and data.
 
@@ -46,7 +48,7 @@ Daily weather for any place on land and any date: the low and the high, rain or 
 
 - **Compiled-in Data**. Define `DASMIG_WEATHER_EMBED` to build the `lite` tier into the program, for WebAssembly and other builds without files.
 
-- **Multi-Instance Support**. Construct independent `wthg` instances with their own data and random engine.
+- **Multi-Instance Support**. Construct independent `wtg` instances with their own data and random engine.
 
 ## Integration
 
@@ -66,7 +68,7 @@ to the files you want to use it in, and supply the [`resources`](https://github.
 
 using namespace std::chrono_literals;
 
-auto& gen = dasmig::wthg::instance(); // loads the lite tier
+auto& gen = dasmig::wtg::instance(); // loads the lite tier
 
 dasmig::weather_request paris;
 paris.latitude = 48.85;
@@ -74,7 +76,7 @@ paris.longitude = 2.35;
 paris.date = 2024y / 1 / 15;
 
 auto day = gen.get_weather(paris, 7); // seed 7
-std::cout << day << '\n';             // 2024-01-15: rain, 5.4 to 7.9 °C, 3.0 mm
+std::cout << day << '\n';             // 2024-01-15: rain, 6.8 to 9.4 °C, 2.8 mm
 std::cout << day.to_json() << '\n';   // every field, with the seed
 
 for (const auto& d : gen.get_weather_series(paris, 7, 42)) // a week, seed 42
@@ -143,7 +145,7 @@ Tested with:
 
 ## License
 
-This library is released under the [MIT License](https://opensource.org/licenses/MIT). The data's sources are listed in [LICENSE_DATA.txt](LICENSE_DATA.txt) and [doc/data.md](doc/data.md).
+This library is released under the [MIT License](https://opensource.org/licenses/MIT). The climate data comes from CRU TS and CRU CL 2.0, which have their own terms (the Open Database License); the sources are listed in [LICENSE_DATA.txt](LICENSE_DATA.txt) and [doc/data.md](doc/data.md).
 
 ```
 MIT License

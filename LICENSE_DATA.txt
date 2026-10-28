@@ -1,3 +1,64 @@
-The data in the resources/ directory is a sample written for this library.
-List each source here with its licence before the first release (see
-doc/data.md).
+Third-party data in weather-generator. How each part is built is described in
+doc/data.md.
+
+1. CRU TS 4.10 (resources/lite/climate.tsv, resources/full/climate.tsv and the
+   compiled-in copy, dasmig/weathergen_data.hpp: the monthly normals of
+   temperature, diurnal range, precipitation, wet days, cloud and, from
+   vapour pressure, humidity)
+   Climatic Research Unit, University of East Anglia: the monthly 0.5-degree
+   grids of 1991-2020, https://crudata.uea.ac.uk/cru/data/hrg/cru_ts_4.10/
+   Harris, I., Osborn, T.J., Jones, P. and Lister, D. (2020). Version 4 of
+   the CRU TS monthly high-resolution gridded multivariate climate dataset.
+   Scientific Data 7:109. https://doi.org/10.1038/s41597-020-0453-3
+   Licensed under the Open Database License (ODbL) v1.0, with the individual
+   contents under the Database Contents License (DbCL) v1.0.
+   https://opendatacommons.org/licenses/odbl/1.0/
+   https://opendatacommons.org/licenses/dbcl/1.0/
+   The climate tables are a database adapted from it by
+   scripts/prepare_climate.py: 30-year means of each calendar month, and
+   2-degree block means for the lite tier.
+
+2. CRU CL 2.0 (the same files: elevation, wind, and each cell's land
+   centroid and area)
+   Climatic Research Unit, University of East Anglia: the 10-minute mean
+   climate grids of 1961-1990, https://crudata.uea.ac.uk/cru/data/hrg/tmc/
+   New, M., Lister, D., Hulme, M. and Makin, I. (2002). A high-resolution
+   data set of surface climate over global land areas. Climate Research
+   21:1-25.
+   Licensed under the ODbL v1.0 and the DbCL v1.0, as above.
+
+3. Natural Earth (resources/lite/land.tsv, resources/full/land.tsv and the
+   compiled-in copy: which half-degree cells hold land)
+   Natural Earth 1:10m Physical Vectors, land and minor islands,
+   https://www.naturalearthdata.com/. Public domain.
+
+4. GHCN-Daily (the model's constants in dasmig/weathergen.hpp)
+   Global Historical Climatology Network - Daily, NOAA National Centers for
+   Environmental Information, https://www.ncei.noaa.gov/products/land-based-station/global-historical-climatology-network-daily
+   Menne, M.J., Durre, I., Vose, R.S., Gleason, B.E. and Houston, T.G.
+   (2012). An overview of the Global Historical Climatology Network-Daily
+   database. Journal of Atmospheric and Oceanic Technology 29:897-910.
+   No station records are included: scripts/calibrate.py fits a few dozen
+   constants on them (rain persistence, gamma shapes, temperature spreads
+   and autocorrelation, wind, snow and thunder probabilities), and the
+   station lists in scripts/ name the stations used.
+
+Because the climate tables are adapted from ODbL sources, the ODbL's terms
+apply to them. In short, and not as legal advice (the licence texts govern):
+
+- Weather generated from the data, such as the days returned by the
+  library, is a "Produced Work" (ODbL section 4.3). Anything you publish that
+  is made from it must carry a notice saying it uses data from the Climatic
+  Research Unit, University of East Anglia (CRU TS 4.10 and CRU CL 2.0) under
+  the ODbL. There is no share-alike requirement for Produced Works.
+
+- If you publicly use or distribute the database itself, or a database
+  adapted from it (for example these files with your changes, an extension
+  layer built from them, or a program with the compiled-in copy), you must
+  credit the sources above, keep this notice, and offer that database under
+  the ODbL v1.0 (share-alike, section 4.4). You may not restrict it with
+  technical measures unless you also offer it without them (section 4.7).
+
+The library's code, and the curated constants marked as such in
+dasmig/weathergen.hpp (cloud and humidity on wet days, the sleet threshold),
+are under the MIT licence of the library.

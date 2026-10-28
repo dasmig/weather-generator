@@ -158,7 +158,8 @@ struct weather_request
     std::chrono::year_month_day date{default_date};
 
     /// @brief Degrees Celsius added to every temperature, -10 to 10. The
-    ///        normals are 1961-1990 means; land has warmed about 1 °C since.
+    ///        normals are 1991-2020 means (centred on 2005); land has warmed
+    ///        about 0.3 °C a decade since.
     double warming{0.0};
 };
 
@@ -177,7 +178,7 @@ struct climate_normals
     std::array<double, 12> precipitation{}; ///< Precipitation, mm per month.
     std::array<double, 12> wet_days{};      ///< Days with at least 0.1 mm.
     std::array<double, 12> humidity{};      ///< Mean relative humidity, %.
-    std::array<double, 12> sunshine{};      ///< Sunshine, % of the possible.
+    std::array<double, 12> cloud{};         ///< Cloud cover, %.
     std::array<double, 12> wind{};          ///< Mean wind speed at 10 m, m/s.
 
     /// @brief Write the normals as a JSON object.
@@ -200,7 +201,7 @@ struct climate_normals
         months("precipitation", precipitation);
         months("wet_days", wet_days);
         months("humidity", humidity);
-        months("sunshine", sunshine);
+        months("cloud", cloud);
         months("wind", wind);
         w.end_object();
     }
@@ -229,8 +230,11 @@ class weather
     double latitude{};     ///< Degrees north: the requested point, or the drawn cell's.
     double longitude{};    ///< Degrees east: the requested point, or the drawn cell's.
     double elevation{};    ///< Metres: the requested elevation, or the cell's.
+    double distance_km{};  ///< Distance from the point to land, km (0 on land; at most 100).
     double tmin{};         ///< Lowest temperature, °C.
+    double tmean{};        ///< Mean temperature, °C: halfway between tmin and tmax.
     double tmax{};         ///< Highest temperature, °C.
+    bool frost{};          ///< tmin below 0 °C.
     double precipitation{}; ///< Precipitation, mm of water (0 on a dry day).
     double snowfall{};     ///< Fresh snow, cm (10 cm per 10 mm of water).
     precipitation_type type{precipitation_type::none}; ///< The form it falls in.
@@ -238,6 +242,13 @@ class weather
     double cloud_cover{};  ///< Mean cloud cover, 0 to 1.
     double humidity{};     ///< Mean relative humidity, %.
     double wind{};         ///< Mean wind speed at 10 m, m/s.
+    double daylight_hours{}; ///< Time from sunrise to sunset, hours (0 in polar night, 24 in polar day).
+    double sunshine_hours{}; ///< Bright sunshine, hours: the daylight not covered by cloud.
+    /// @brief Sunrise, UTC (unset in polar day and polar night). It can fall
+    ///        on the date before in UTC, far east of Greenwich.
+    std::optional<std::chrono::sys_time<std::chrono::minutes>> sunrise{}; // NOLINT(readability-redundant-member-init)
+    /// @brief Sunset, UTC (unset in polar day and polar night).
+    std::optional<std::chrono::sys_time<std::chrono::minutes>> sunset{}; // NOLINT(readability-redundant-member-init)
     weather_condition condition{weather_condition::clear}; ///< The day in a word.
 
     /// @brief Retrieve the random seed used to generate this weather.
@@ -246,7 +257,7 @@ class weather
     [[nodiscard]] std::uint64_t seed() const { return _signature.seed; }
 
     /// @brief The seed and the data this weather was generated from.
-    /// @return The replay signature; `data` is wthg::data_hash() at the
+    /// @return The replay signature; `data` is wtg::data_hash() at the
     ///         time of generation.
     [[nodiscard]] const core::seed_signature& signature() const { return _signature; }
 
@@ -256,6 +267,19 @@ class weather
     {
         return std::format("{:04d}-{:02d}-{:02d}", static_cast<int>(date.year()),
                            static_cast<unsigned>(date.month()), static_cast<unsigned>(date.day()));
+    }
+
+    /// @brief An instant as ISO 8601 UTC to the minute (`2024-01-15T07:42Z`).
+    /// @param t The instant.
+    /// @return The string.
+    [[nodiscard]] static std::string time_string(std::chrono::sys_time<std::chrono::minutes> t)
+    {
+        const auto day = std::chrono::floor<std::chrono::days>(t);
+        const std::chrono::year_month_day ymd{day};
+        const auto minutes = (t - day).count();
+        return std::format("{:04d}-{:02d}-{:02d}T{:02d}:{:02d}Z", static_cast<int>(ymd.year()),
+                           static_cast<unsigned>(ymd.month()), static_cast<unsigned>(ymd.day()), minutes / 60,
+                           minutes % 60);
     }
 
     /// @brief Human-readable summary string.
@@ -286,10 +310,13 @@ class weather
             .field("latitude", latitude)
             .field("longitude", longitude)
             .field("elevation", elevation)
+            .field("distance_km", distance_km)
             .end_object()
             .field("condition", dasmig::to_string(condition))
             .field("tmin", tmin)
+            .field("tmean", tmean)
             .field("tmax", tmax)
+            .field("frost", frost)
             .field("precipitation", precipitation)
             .field("snowfall", snowfall)
             .field("type", dasmig::to_string(type))
@@ -297,7 +324,17 @@ class weather
             .field("cloud_cover", cloud_cover)
             .field("humidity", humidity)
             .field("wind", wind)
-            .key("signature");
+            .field("daylight_hours", daylight_hours)
+            .field("sunshine_hours", sunshine_hours);
+        const auto instant = [&](std::string_view name, const auto& t)
+        {
+            w.key(name);
+            if (t) w.value(time_string(*t));
+            else w.value(nullptr);
+        };
+        instant("sunrise", sunrise);
+        instant("sunset", sunset);
+        w.key("signature");
         _signature.to_json(w);
         w.end_object();
     }
@@ -331,17 +368,18 @@ class weather
 
   private:
     core::seed_signature _signature;
-    friend class wthg;
+    friend class wtg;
 };
 
 /// @brief Weather Generator: daily weather drawn around monthly climate
 ///        normals.
 ///
 /// A Richardson (1981) type weather generator: rain falls by a two-state
-/// Markov chain, wet-day amounts are gamma distributed, Tmax and Tmin follow
-/// the season with residuals from a lag-1 autoregressive process, and cloud,
+/// Markov chain, wet-day amounts are gamma distributed, the daily mean
+/// temperature and the daily range follow the season with residuals from a
+/// lag-1 autoregressive process, months carry their own anomalies, and cloud,
 /// humidity and wind follow the wet and dry days. Its parameters come from
-/// the place's monthly normals (CRU CL 2.0, 1961-1990) and from fits on
+/// the place's monthly normals (CRU TS 4.10, 1991-2020) and from fits on
 /// GHCN-Daily stations (doc/data.md).
 ///
 /// A day's weather depends only on the seed, the place and the date: the
@@ -356,7 +394,7 @@ class weather
 /// @par Thread safety
 /// Each instance is independent. Concurrent calls to get_weather(request)
 /// on the **same** instance require external synchronisation.
-class wthg
+class wtg
 {
   public:
     /// @brief The longest series one call returns, in days (about 100 years).
@@ -364,22 +402,22 @@ class wthg
 
     /// @brief Default constructor — creates an empty generator with no
     ///        data.
-    wthg() = default;
+    wtg() = default;
 
-    wthg(const wthg&) = delete;            ///< Not copyable.
-    wthg& operator=(const wthg&) = delete; ///< Not copyable.
-    wthg(wthg&&) noexcept = default;       ///< Movable.
-    wthg& operator=(wthg&&) noexcept = default; ///< Movable.
-    ~wthg() = default;                     ///< Destructor.
+    wtg(const wtg&) = delete;            ///< Not copyable.
+    wtg& operator=(const wtg&) = delete; ///< Not copyable.
+    wtg(wtg&&) noexcept = default;       ///< Movable.
+    wtg& operator=(wtg&&) noexcept = default; ///< Movable.
+    ~wtg() = default;                     ///< Destructor.
 
     /// @brief Access the global singleton instance.
     ///
     /// Loads the `lite` tier (or `full` if `lite` is missing) on first
     /// access, from compiled-in data or an auto-probed `resources/`.
     /// @return The singleton.
-    static wthg& instance()
+    static wtg& instance()
     {
-        static wthg inst{auto_probe_tag{}};
+        static wtg inst{auto_probe_tag{}};
         return inst;
     }
 
@@ -447,13 +485,13 @@ class wthg
     /// @param longitude Degrees east, -180 to 180.
     /// @return The cell's normals.
     /// @throws std::runtime_error If no data has been loaded.
-    /// @throws std::invalid_argument If the point is out of range.
+    /// @throws std::invalid_argument If the point is out of range or more
+    ///         than 100 km from land.
     [[nodiscard]] climate_normals climate_at(double latitude, double longitude) const
     {
         require_data_();
         check_point_(latitude, longitude);
-        const auto& c = _cells[nearest_(unit_vector_(latitude, longitude))];
-        return c.normals;
+        return _cells[locate_(latitude, longitude).cell].normals;
     }
 
     // -- Batch generation -------------------------------------------------
@@ -545,8 +583,10 @@ class wthg
     /// @brief Load data from a resource directory, replacing all data and
     ///        layers loaded before.
     ///
-    /// Expects the directory to contain `climate.tsv`. A path that is not a
-    /// directory, or a directory without the file, is ignored.
+    /// Expects the directory to contain `climate.tsv`, and reads the land
+    /// mask from `land.tsv` when it is there (without one, a point must be
+    /// within 100 km of a cell). A path that is not a directory, or a
+    /// directory without `climate.tsv`, is ignored.
     ///
     /// @param dir Directory such as `resources/lite`.
     /// @throws core::tsv_error If the file is malformed.
@@ -559,13 +599,15 @@ class wthg
             return;
         }
         (void)extend(core::tsv_document::load(file), core::layer_mode::replace);
+        const auto mask = dir / land_file_;
+        _land = std::filesystem::is_regular_file(mask, ec) ? read_land_(core::tsv_document::load(mask)) : land_mask{};
     }
 
     /// @brief Load a dataset tier, replacing all data and layers loaded
     ///        before.
     ///
-    /// `lite` is a 2-degree grid (5,043 cells), `full` a half-degree grid
-    /// (67,129 cells). Uses the compiled-in copy when the library is built
+    /// `lite` is a 2-degree grid (5,163 cells), `full` a half-degree grid
+    /// (67,213 cells). Uses the compiled-in copy when the library is built
     /// with `DASMIG_WEATHER_EMBED`, otherwise searches `resources/`,
     /// `../resources`, `weather-generator/resources` and
     /// `../weather-generator/resources`.
@@ -579,6 +621,9 @@ class wthg
         auto doc = core::load_resource(path, embedded_files_(), core::find_resources(library_name_, path));
         if (!doc) return false;
         (void)extend(std::move(*doc), core::layer_mode::replace);
+        const std::string mask = std::string{core::tier_name(tier)} + "/" + std::string{land_file_};
+        auto land = core::load_resource(mask, embedded_files_(), core::find_resources(library_name_, mask));
+        _land = land ? read_land_(*land) : land_mask{};
         return true;
     }
 
@@ -589,7 +634,7 @@ class wthg
     /// the loaded row with the same key and new keys are added (a station's
     /// own normals, say, which then serve the points nearest it); a row with
     /// `disabled` set to 1 removes its key. `elevation`, `area`, `humidity`,
-    /// `sunshine` and `wind` may be left out (0 m, never drawn as a random
+    /// `cloud` and `wind` may be left out (0 m, never drawn as a random
     /// place, 70%, 50% and 3.5 m/s).
     ///
     /// @param file The layer file.
@@ -641,60 +686,63 @@ class wthg
   private:
     // -- The model's constants --------------------------------------------
     //
-    // Fitted on GHCN-Daily stations, 1961-1990, by scripts/calibrate.py
-    // unless marked curated; doc/data.md has the fits.
+    // Fitted on GHCN-Daily stations, 1991-2020, by scripts/calibrate.py
+    // unless marked tuned (adjusted from the fit with scripts/validate.py)
+    // or curated; doc/data.md has the fits.
 
     struct model
     {
         // Rain persistence d = P(wet | wet) - P(wet | dry) = d0 + d1 f
-        // (Geng et al. 1986 found 0.25).
-        static constexpr double persistence0 = 0.235;
-        static constexpr double persistence1 = 0.04656;
+        // (Geng et al. 1986 found 0.25). Tuned: the fit gives d0 = 0.277,
+        // lowered because the month anomalies also cluster wet days.
+        static constexpr double persistence0 = 0.27;
+        static constexpr double persistence1 = 0.00647;
 
         // Gamma shape of wet-day amounts = a0 + a1 ln(mean wet-day mm).
-        static constexpr double shape0 = 1.15563;
-        static constexpr double shape1 = -0.21773;
+        static constexpr double shape0 = 1.14578;
+        static constexpr double shape1 = -0.22430;
         static constexpr double shape_min = 0.4;
         static constexpr double shape_max = 1.5;
 
         // Dry-day minus wet-day daily mean temperature and daily range, as
         // shares of the diurnal range: wet days are a little cooler and have
-        // a much smaller range (cooler afternoons, warmer nights).
-        static constexpr double wet_mean = -0.017;
-        static constexpr double wet_range = 0.27;
+        // a much smaller range (cooler afternoons, warmer nights). The mean's
+        // is tuned from the fit's 0.032 so the generated dry-minus-wet Tmax
+        // matches the stations once the residuals and anomalies are added;
+        // the range's is the fit's.
+        static constexpr double wet_mean = 0.016;
+        static constexpr double wet_range = 0.2204;
 
         // Day-to-day spread (°C) of the daily mean temperature and of the
         // daily range = c . (1, annual range, dtr, f, season, season * range,
         // |latitude|), where season is the day's mean temperature against
         // the year's, -1 (coldest) to 1.
-        static constexpr std::array<double, 7> spread_mean{-1.16308, 0.04749, 0.13838, 1.23453,
-                                                           -0.10402, -0.04992, 0.04011};
-        static constexpr std::array<double, 7> spread_range{-0.31493, 0.01891, 0.19971, 0.82428,
-                                                            -0.24136, -0.00653, 0.01632};
+        static constexpr std::array<double, 7> spread_mean{-1.21055, 0.05030, 0.15209, 1.31636, -0.19543, -0.04674, 0.03630};
+        static constexpr std::array<double, 7> spread_range{-0.37573, 0.02161, 0.20729, 0.85934, -0.25677, -0.00543, 0.01475};
         static constexpr double spread_min = 0.2;
         static constexpr double spread_max = 12.0;
 
         // Lag-1 autoregression of the standardized (mean, range) residuals:
         // x_t = A x_{t-1} + B e_t (Richardson 1981), row-major.
-        static constexpr std::array<double, 4> a{0.68714569, 0.07319743, -0.05869707, 0.30698095};
-        static constexpr std::array<double, 4> b{0.71603136, 0.0, 0.12589317, 0.94213609};
+        static constexpr std::array<double, 4> a{0.69497378, 0.06841554, -0.05222351, 0.30667295};
+        static constexpr std::array<double, 4> b{0.71084994, 0.0, 0.09968858, 0.94429324};
 
         // Weibull shape of the daily mean wind, and Gamma(1 + 1/k).
-        static constexpr double wind_shape = 2.775;
-        static constexpr double wind_gamma = 0.89015149;
+        static constexpr double wind_shape = 2.902;
+        static constexpr double wind_gamma = 0.89171496;
 
         // Snow on a wet day: logit p = s0 + s1 T, T the daily mean
-        // temperature (p = 0.5 at 1.4 °C). Curated: snow above sleet_above
+        // temperature (p = 0.5 at 0.76 °C). Curated: snow above sleet_above
         // falls as sleet.
-        static constexpr double snow0 = 0.9159;
-        static constexpr double snow1 = -0.6340;
+        static constexpr double snow0 = 0.4632;
+        static constexpr double snow1 = -0.6058;
         static constexpr double sleet_above = 1.0;
 
         // Thunder on a rain or sleet day: logit p = t0 + t1 Tmax + t2 ln(mm)
         // (fitted on US stations, whose reports are consistent).
-        static constexpr std::array<double, 3> thunder{-5.4017, 0.1639, 0.3700};
+        static constexpr std::array<double, 3> thunder{-5.0964, 0.1213, 0.3431};
 
-        // Curated (doc/data.md): cloud cover is 1 - sunshine; wet days have
+        // Curated (doc/data.md): wet days have
         // cloud_wet of the clear sky left covered on top of the mean, and
         // daily cover is Beta with concentration cloud_kappa.
         static constexpr double cloud_wet = 0.6;
@@ -707,11 +755,11 @@ class wthg
         // Month-to-month anomalies (tuned with scripts/validate.py so the
         // year-to-year spread of monthly means matches the stations): the
         // temperature anomaly's share of the daily spread, and the log
-        // spread of the wet-day fraction and the wet-day amount, all moved
-        // by one precipitation anomaly.
-        static constexpr double temperature_month = 0.42;
-        static constexpr double wet_month = 0.16;
-        static constexpr double amount_month = 0.37;
+        // spread of the odds of a wet day and of the wet-day amount, both
+        // moved by one precipitation anomaly.
+        static constexpr double temperature_month = 0.48;
+        static constexpr double wet_month = 0.32;
+        static constexpr double amount_month = 0.28;
 
         static constexpr double lapse_rate = 0.0065; // °C per metre (the standard atmosphere)
 
@@ -725,12 +773,44 @@ class wthg
 
     static constexpr std::string_view library_name_ = "weather-generator";
     static constexpr std::string_view data_file_ = "climate.tsv";
+    static constexpr std::string_view land_file_ = "land.tsv";
+
+    // The land cells of a 0.5-degree grid, as runs of columns per row: row
+    // i is centred at -89.75 + 0.5 i, column j at -179.75 + 0.5 j.
+    static constexpr int land_rows = 360;
+    static constexpr int land_columns = 720;
+    static constexpr double sea_limit_km = 100.0;
+    static constexpr double earth_radius_km = 6371.0;
+    using land_mask = std::vector<std::vector<std::pair<int, int>>>; // per row: [first, last] columns
+
+    static land_mask read_land_(const core::tsv_document& doc)
+    {
+        land_mask mask(land_rows);
+        for (const auto& row : doc.rows())
+        {
+            const auto i = row.get<int>("row");
+            if (i < 0 || i >= land_rows) throw row.error("row", "must be 0 to 359");
+            for (const auto run : row.list("columns"))
+            {
+                const auto dash = run.find('-');
+                const auto a = core::detail::parse_number<int>(run.substr(0, dash));
+                const auto b = dash == std::string_view::npos ? a : core::detail::parse_number<int>(run.substr(dash + 1));
+                if (!a || !b || *a < 0 || *b < *a || *b >= land_columns)
+                {
+                    throw row.error("columns", "must be runs such as 12-40 of columns 0 to 719");
+                }
+                mask[static_cast<std::size_t>(i)].emplace_back(*a, *b);
+            }
+            std::ranges::sort(mask[static_cast<std::size_t>(i)]);
+        }
+        return mask;
+    }
 
     static core::table_schema schema_()
     {
         return {.key = {"key"},
                 .required = {"latitude", "longitude", "tmean", "dtr", "precipitation", "wet_days"},
-                .optional = {"elevation", "area", "humidity", "sunshine", "wind"}};
+                .optional = {"elevation", "area", "humidity", "cloud", "wind"}};
     }
 
     // True when x is not a number in [lo, hi].
@@ -798,7 +878,7 @@ class wthg
             n.precipitation = read_months_(row, "precipitation", 0.0, 5000.0);
             n.wet_days = read_months_(row, "wet_days", 0.0, 31.0);
             n.humidity = row.has("humidity") ? read_months_(row, "humidity", 0.0, 100.0) : constant_(70.0);
-            n.sunshine = row.has("sunshine") ? read_months_(row, "sunshine", 0.0, 100.0) : constant_(50.0);
+            n.cloud = row.has("cloud") ? read_months_(row, "cloud", 0.0, 100.0) : constant_(50.0);
             n.wind = row.has("wind") ? read_months_(row, "wind", 0.0, 60.0) : constant_(3.5);
             return c;
         }
@@ -824,6 +904,7 @@ class wthg
     std::vector<cell> _cells; // in table row order
     std::vector<std::uint32_t> _tree; // k-d tree over the cells' unit vectors (implicit, median-split)
     core::weighted_table<std::size_t> _area; // cell index, by land area
+    land_mask _land;                         // empty when the data has no land.tsv
 
     core::rng _engine{core::rng::from_entropy()};
 
@@ -831,7 +912,7 @@ class wthg
     {
     };
 
-    explicit wthg(auto_probe_tag /*tag*/)
+    explicit wtg(auto_probe_tag /*tag*/)
     {
         if (!load(dataset::lite)) (void)load(dataset::full);
     }
@@ -899,6 +980,58 @@ class wthg
         }
     }
 
+    static double sin_deg_(double degrees) { return sin_cos_deg_(degrees).first; }
+    static double cos_deg_(double degrees) { return sin_cos_deg_(degrees).second; }
+
+    // atan from + - * / only, for the same reason: odd Taylor series on
+    // |x| <= tan(pi / 8) after two reductions (error below 1e-17).
+    static double atan_(double x)
+    {
+        const bool negative = x < 0.0;
+        if (negative) x = -x;
+        const bool inverted = x > 1.0;
+        if (inverted) x = 1.0 / x;
+        double base = 0.0;
+        if (x > 0.41421356237309503) // tan(pi / 8)
+        {
+            x = (x - 1.0) / (x + 1.0);
+            base = std::numbers::pi / 4.0;
+        }
+        const double x2 = core::math::fenced(x * x);
+        double sum = 0.0;
+        for (int n = 25; n >= 0; --n) sum = fma_free_(sum, x2, (n % 2 == 0 ? 1.0 : -1.0) / ((2.0 * n) + 1.0));
+        double r = base + core::math::fenced(sum * x);
+        if (inverted) r = (std::numbers::pi / 2.0) - r;
+        return negative ? -r : r;
+    }
+
+    // atan2, asin and acos in degrees.
+    static double atan2_deg_(double y, double x)
+    {
+        constexpr double deg = 180.0 / std::numbers::pi;
+        if (x > 0.0) return atan_(y / x) * deg;
+        if (x < 0.0) return (atan_(y / x) * deg) + (y >= 0.0 ? 180.0 : -180.0);
+        if (y == 0.0) return 0.0;
+        return y > 0.0 ? 90.0 : -90.0;
+    }
+
+    static double asin_deg_(double x)
+    {
+        return atan2_deg_(x, std::sqrt(std::max(0.0, 1.0 - core::math::fenced(x * x))));
+    }
+
+    static double acos_deg_(double x)
+    {
+        return atan2_deg_(std::sqrt(std::max(0.0, 1.0 - core::math::fenced(x * x))), x);
+    }
+
+    // Great-circle distance in km between two unit vectors.
+    static double km_(const std::array<double, 3>& a, const std::array<double, 3>& b)
+    {
+        constexpr double rad = std::numbers::pi / 180.0;
+        return 2.0 * earth_radius_km * asin_deg_(std::min(1.0, std::sqrt(distance2_(a, b)) / 2.0)) * rad;
+    }
+
     static std::array<double, 3> unit_vector_(double latitude, double longitude)
     {
         const auto [slat, clat] = sin_cos_deg_(latitude);
@@ -953,7 +1086,7 @@ class wthg
                 wet.at(m) = std::min(n.wet_days.at(m), ml) / ml;
                 total += n.precipitation.at(m);
                 total_wet += n.wet_days.at(m);
-                cloud.at(m) = 1.0 - (n.sunshine.at(m) / 100.0);
+                cloud.at(m) = n.cloud.at(m) / 100.0;
             }
             const double annual_amount = total_wet > 0.0 ? total / total_wet : 0.0;
             for (std::size_t m = 0; m < 12; ++m)
@@ -1108,18 +1241,26 @@ class wthg
         const double zp = a[1] + core::math::fenced(t * (b[1] - a[1]));
         // Variance of the interpolated anomaly, to keep means and spreads.
         const double v = core::math::fenced((1.0 - t) * (1.0 - t)) + core::math::fenced(t * t);
-        // Log-normal factors on the wet-day fraction and amount; the amount's
-        // correction also takes their covariance, so the expected total stays.
+        // The precipitation anomaly scales the odds of a wet day, so the
+        // fraction stays below 1 however wet the month, and the wet-day amount
+        // by a log-normal factor. Each correction keeps its expected value:
+        // the odds' moves from -1/2 to +1/2 of the variance with the fraction
+        // (a dry month's fraction scales like the odds, a wet month's dry
+        // fraction like their inverse), and the amount's also takes its
+        // covariance with the fraction, f (1 - f) sf zp, so the expected
+        // total stays.
         const auto factor = [&](double sigma, double correction)
         { return core::math::exp(core::math::fenced(sigma * zp) - core::math::fenced(0.5 * correction * v)); };
         constexpr double sf = model::wet_month;
         constexpr double sa = model::amount_month;
+        const double f = std::clamp(lerp(c.wet), 0.0, 1.0);
+        const double odds = factor(sf, sf * sf * (1.0 - (2.0 * f)));
 
         day_params p{};
         p.tmean = lerp(c.tmean);
         p.dtr = std::max(lerp(c.dtr), 0.0);
-        p.wet = std::clamp(lerp(c.wet) * factor(sf, sf * sf), 0.0, 0.97);
-        p.amount = std::max(lerp(c.amount) * factor(sa, (sa * sa) + (2.0 * sf * sa)), 0.1);
+        p.wet = std::min((f * odds) / ((f * odds) + (1.0 - f)), 0.995);
+        p.amount = std::max(lerp(c.amount) * factor(sa, (sa * sa) + (2.0 * sf * sa * (1.0 - f))), 0.1);
         p.humidity = std::clamp(lerp(c.humidity), 1.0, 100.0);
         p.cloud = std::clamp(lerp(c.cloud), 0.0, 1.0);
         p.wind = std::max(lerp(c.wind), 0.0);
@@ -1210,6 +1351,61 @@ class wthg
         return table;
     }
 
+    struct sun
+    {
+        double daylight_minutes{};
+        std::optional<double> rise; // minutes after 00:00 UTC of the date (may be negative or past 1440)
+        std::optional<double> set;
+    };
+
+    // Sunrise, sunset and day length on a date at a point, by NOAA's solar
+    // calculator equations (Meeus): the sun's position at local noon, the
+    // equation of time, and the hour angle at which the sun's centre is
+    // 0.833 degrees below the horizon (refraction and the sun's radius).
+    static sun sun_(std::chrono::sys_days day, double latitude, double longitude) // NOLINT(bugprone-easily-swappable-parameters)
+    {
+        using core::math::fenced;
+        const double days = static_cast<double>(day.time_since_epoch().count());
+        // Julian centuries since J2000.0 at local mean noon.
+        const double jd = days + 2440587.5 + 0.5 - (longitude / 360.0);
+        const double t = (jd - 2451545.0) / 36525.0;
+        const auto reduce = [](double x) { return x - (360.0 * std::floor(x / 360.0)); };
+        const double l0 = reduce(280.46646 + fenced(t * (36000.76983 + fenced(t * 0.0003032))));
+        const double m = reduce(357.52911 + fenced(t * (35999.05029 - fenced(0.0001537 * t))));
+        const double e = 0.016708634 - fenced(t * (0.000042037 + fenced(0.0000001267 * t)));
+        const double c = fenced(sin_deg_(m) * (1.914602 - fenced(t * (0.004817 + fenced(0.000014 * t))))) +
+                         fenced(sin_deg_(2.0 * m) * (0.019993 - fenced(0.000101 * t))) +
+                         fenced(sin_deg_(3.0 * m) * 0.000289);
+        const double omega = reduce(125.04 - fenced(1934.136 * t));
+        const double lambda = l0 + c - 0.00569 - fenced(0.00478 * sin_deg_(omega));
+        const double eps0 =
+            23.0 + ((26.0 + ((21.448 - fenced(t * (46.815 + fenced(t * (0.00059 - fenced(t * 0.001813)))))) / 60.0)) /
+                    60.0);
+        const double eps = eps0 + fenced(0.00256 * cos_deg_(omega));
+        const double decl = asin_deg_(fenced(sin_deg_(eps) * sin_deg_(lambda)));
+        const double ty = sin_deg_(eps / 2.0) / cos_deg_(eps / 2.0);
+        const double y = fenced(ty * ty);
+        constexpr double deg = 180.0 / std::numbers::pi;
+        const double eq_time =
+            4.0 * deg *
+            (fenced(y * sin_deg_(2.0 * l0)) - fenced(2.0 * e * sin_deg_(m)) +
+             fenced(4.0 * e * y * sin_deg_(m) * cos_deg_(2.0 * l0)) - fenced(0.5 * y * y * sin_deg_(4.0 * l0)) -
+             fenced(1.25 * e * e * sin_deg_(2.0 * m)));
+        const double noon = 720.0 - fenced(4.0 * longitude) - eq_time;
+
+        const double denominator = fenced(cos_deg_(latitude) * cos_deg_(decl));
+        const double numerator = cos_deg_(90.833) - fenced(sin_deg_(latitude) * sin_deg_(decl));
+        // cos(hour angle) = numerator / denominator: above 1 the sun never
+        // rises, below -1 it never sets.
+        if (std::abs(denominator) < 1e-12 || numerator >= denominator || numerator <= -denominator)
+        {
+            const bool polar_day = (latitude > 0.0) == (decl > 0.0);
+            return {.daylight_minutes = polar_day ? 1440.0 : 0.0, .rise = std::nullopt, .set = std::nullopt};
+        }
+        const double hour_angle = acos_deg_(numerator / denominator);
+        return {.daylight_minutes = 8.0 * hour_angle, .rise = noon - (4.0 * hour_angle), .set = noon + (4.0 * hour_angle)};
+    }
+
     // x rounded to 1 / per (round_to_(x, 10) to 0.1): the division gives the
     // double nearest the decimal, so JSON prints -1.2, not -1.2000000000000002;
     // adding 0 turns -0 into 0.
@@ -1240,20 +1436,86 @@ class wthg
         std::size_t cell{0};
         double latitude{0.0};
         double longitude{0.0};
+        double distance_km{0.0};
     };
+
+    // Distance in km from a point to the nearest land cell of the mask
+    // (0 inside one), searched within the rows and columns that can be
+    // within the limit; infinity when there is no mask or no land near.
+    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+    [[nodiscard]] double land_km_(double latitude, double longitude, const std::array<double, 3>& q) const
+    {
+        if (_land.empty()) return std::numeric_limits<double>::infinity();
+        const auto row_of = [](double lat) { return std::clamp(static_cast<int>(std::floor((lat + 90.0) * 2.0)), 0, land_rows - 1); };
+        const auto column_of = [](double lon)
+        { return ((static_cast<int>(std::floor((lon + 180.0) * 2.0)) % land_columns) + land_columns) % land_columns; };
+        const auto is_land = [&](int i, int j)
+        {
+            for (const auto& [a, b] : _land[static_cast<std::size_t>(i)])
+            {
+                if (j < a) return false;
+                if (j <= b) return true;
+            }
+            return false;
+        };
+        const int i0 = row_of(latitude);
+        const int j0 = column_of(longitude);
+        if (is_land(i0, j0)) return 0.0;
+
+        double best = std::numeric_limits<double>::infinity();
+        for (int i = std::max(0, i0 - 2); i <= std::min(land_rows - 1, i0 + 2); ++i)
+        {
+            const double south = -90.0 + (0.5 * i);
+            const double north = south + 0.5;
+            const double nearest_lat = std::clamp(latitude, south, north);
+            // Columns that can lie within the limit at this row's widest
+            // latitude, plus one for the cell's own width.
+            const double widest = std::max(std::abs(south), std::abs(north));
+            const double km_per_degree = std::max(1e-6, cos_deg_(std::min(widest, 89.999)) * 111.19);
+            const int reach = std::min(land_columns / 2, static_cast<int>(sea_limit_km / km_per_degree * 2.0) + 2);
+            for (int dj = -reach; dj <= reach; ++dj)
+            {
+                const int j = (((j0 + dj) % land_columns) + land_columns) % land_columns;
+                if (!is_land(i, j)) continue;
+                const double west = -180.0 + (0.5 * j);
+                // The cell's nearest longitude to the point, across the date line.
+                double offset = longitude - west;
+                offset -= 360.0 * std::floor(offset / 360.0); // 0 to 360 east of the cell's west edge
+                double nearest_lon = west; // the point lies west of the cell
+                if (offset <= 0.5) nearest_lon = longitude;
+                else if (offset < 180.25) nearest_lon = west + 0.5;
+                best = std::min(best, km_(q, unit_vector_(nearest_lat, nearest_lon)));
+            }
+        }
+        return best;
+    }
+
+    // The cell a point uses and its distance to land: the nearest cell by
+    // chord, if the point is within 100 km of the mask's land or of a cell.
+    [[nodiscard]] place locate_(double latitude, double longitude) const
+    {
+        const auto q = unit_vector_(latitude, longitude);
+        const std::size_t index = nearest_(q);
+        const double km = std::min(land_km_(latitude, longitude, q), km_(q, _cells[index].xyz));
+        if (!(km <= sea_limit_km))
+        {
+            throw std::invalid_argument(std::format(
+                "weather-generator: ({}, {}) is {} km from land; the data covers land only, without Antarctica",
+                latitude, longitude, std::isfinite(km) ? std::format("{:.0f}", km) : std::string{"far"}));
+        }
+        return {.cell = index, .latitude = latitude, .longitude = longitude, .distance_km = km};
+    }
 
     [[nodiscard]] place place_(const weather_request& request, const core::rng& call) const
     {
-        if (request.latitude)
-        {
-            return {.cell = nearest_(unit_vector_(*request.latitude, *request.longitude)),
-                    .latitude = *request.latitude,
-                    .longitude = *request.longitude};
-        }
+        if (request.latitude) return locate_(*request.latitude, *request.longitude);
         if (_area.empty()) throw std::invalid_argument("weather-generator: no cell has an area to draw a place from");
         auto r = call.split("place");
         const std::size_t index = _area.pick(r);
-        return {.cell = index, .latitude = _cells[index].normals.latitude, .longitude = _cells[index].normals.longitude};
+        return {.cell = index,
+                .latitude = _cells[index].normals.latitude,
+                .longitude = _cells[index].normals.longitude,
+                .distance_km = 0.0};
     }
 
     static std::uint64_t day_index_(std::chrono::sys_days day)
@@ -1445,10 +1707,22 @@ class wthg
             w.latitude = where.latitude;
             w.longitude = where.longitude;
             w.elevation = round_to_(elevation, 1.0);
+            w.distance_km = round_to_(where.distance_km, 10.0);
             if (wet) precipitation_(w, p, t, day_rng);
             sky_(w, p, wet, day_rng);
             w.tmin = round_to_(t.tmin, 10.0);
+            w.tmean = round_to_(t.mean, 10.0);
             w.tmax = round_to_(t.tmax, 10.0);
+            w.frost = w.tmin < 0.0;
+            const auto sun = sun_(day, where.latitude, where.longitude);
+            w.daylight_hours = round_to_(sun.daylight_minutes / 60.0, 100.0);
+            // Sunshine: the daylight left uncovered by the day's cloud
+            // (curated; doc/data.md).
+            w.sunshine_hours = round_to_((sun.daylight_minutes / 60.0) * (1.0 - w.cloud_cover), 10.0);
+            const auto instant = [&](double minutes)
+            { return std::chrono::sys_time<std::chrono::minutes>{day} + std::chrono::minutes{std::llround(minutes)}; };
+            if (sun.rise) w.sunrise = instant(*sun.rise);
+            if (sun.set) w.sunset = instant(*sun.set);
             w.condition = condition_(w);
             out.push_back(std::move(w));
         }

@@ -3,7 +3,7 @@
 The climate table (scripts/prepare_climate.py) gives monthly means only.
 What turns them into days is fitted here, on daily observations from the
 Global Historical Climatology Network (GHCN-Daily, NOAA NCEI, public
-domain), 1961-1990 to match the CRU normals:
+domain), 1991-2020 to match the climate table's normals:
 
 - rain persistence: d = P(wet | wet) - P(wet | dry), against the month's
   wet-day fraction f (then P(wet | dry) = f (1 - d), P(wet | wet) = P(wet |
@@ -19,16 +19,20 @@ domain), 1961-1990 to match the CRU normals:
 - the Weibull shape of daily mean wind against the monthly mean (AWND, any
   years, since few stations report it before the 1980s);
 - the rain/snow split by daily mean temperature (SNOW > 0 on wet days);
-- the thunder probability on wet days (WT03, at stations that report it).
+- the thunder probability on wet days (WT03, at the US stations of the fit
+  list and of scripts/ghcn_thunder.txt, whose reports are consistent).
 
 Usage:
   python scripts/calibrate.py select GHCN_DIR          # writes scripts/ghcn_stations.txt
-  python scripts/calibrate.py fetch GHCN_DIR           # downloads the stations' files
-  python scripts/calibrate.py fit GHCN_DIR CRU_DIR     # prints the parameters
+  python scripts/calibrate.py holdout GHCN_DIR         # writes scripts/ghcn_holdout.txt
+  python scripts/calibrate.py thunder GHCN_DIR         # writes scripts/ghcn_thunder.txt
+  python scripts/calibrate.py fetch GHCN_DIR [--list FILE]  # downloads the stations' files
+  python scripts/calibrate.py fit GHCN_DIR [CLIMATE]   # prints the parameters
 
 GHCN_DIR holds ghcnd-inventory.txt and ghcnd-stations.txt from
 https://www.ncei.noaa.gov/pub/data/ghcn/daily/; `fetch` puts by_station/*.csv.gz
-beside them. CRU_DIR is prepare_climate.py's input.
+beside them. CLIMATE is the full tier's climate.tsv (the default), so each
+station is fitted against the normals the library uses.
 """
 
 import argparse
@@ -45,17 +49,19 @@ import numpy as np
 
 HERE = Path(__file__).resolve().parent
 STATIONS = HERE / "ghcn_stations.txt"
+HOLDOUT = HERE / "ghcn_holdout.txt"
+THUNDER = HERE / "ghcn_thunder.txt"
 BASE = "https://www.ncei.noaa.gov/pub/data/ghcn/daily/by_station/"
-FIRST, LAST = 1961, 1990
+FIRST, LAST = 1991, 2020
 WET = 1  # tenths of a mm: a wet day has at least 0.1 mm
 
 
 # -- select ------------------------------------------------------------------
 
 
-def select(ghcn):
-    """One station per 10-degree box: the one with the longest TMAX, TMIN and
-    PRCP record covering 1961-1990 (ties by id)."""
+def candidates(ghcn):
+    """Stations with TMAX, TMIN and PRCP records covering 1991-2020: id ->
+    (record length in years, lat, lon)."""
     spans = defaultdict(dict)
     where = {}
     with open(ghcn / "ghcnd-inventory.txt", encoding="ascii") as f:
@@ -64,28 +70,126 @@ def select(ghcn):
             if el in ("TMAX", "TMIN", "PRCP"):
                 spans[sid][el] = (int(y0), int(y1))
                 where[sid] = (float(lat), float(lon))
-    best = {}
+    out = {}
     for sid, s in spans.items():
         if len(s) < 3 or any(a > FIRST or b < LAST for a, b in s.values()):
             continue
-        length = min(b - a for a, b in s.values())
-        lat, lon = where[sid]
-        box = (math.floor(lat / 10), math.floor(lon / 10))
-        if box not in best or (length, sid) > best[box][0]:
-            best[box] = ((length, sid), sid)
-    chosen = sorted(v[1] for v in best.values())
-    with open(STATIONS, "w", encoding="ascii", newline="\n") as f:
-        f.write("# GHCN-Daily stations for scripts/calibrate.py fit: one per 10-degree box,\n")
-        f.write("# the longest TMAX/TMIN/PRCP record covering 1961-1990.\n")
+        out[sid] = (min(b - a for a, b in s.values()), *where[sid])
+    return out
+
+
+def box_of(lat, lon):
+    return (math.floor(lat / 10), math.floor(lon / 10))
+
+
+def best_per_box(cands, keep=lambda sid: True):
+    """The longest record per 10-degree box among the stations kept (ties by id)."""
+    best = {}
+    for sid, (length, lat, lon) in cands.items():
+        if not keep(sid):
+            continue
+        box = box_of(lat, lon)
+        if box not in best or (length, sid) > best[box]:
+            best[box] = (length, sid)
+    return sorted(v[1] for v in best.values())
+
+
+def km(lat1, lon1, lat2, lon2):
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    h = math.sin((p2 - p1) / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(math.radians(lon2 - lon1) / 2) ** 2
+    return 2 * 6371.0 * math.asin(math.sqrt(h))
+
+
+def write_list(path, chosen, cands, header):
+    with open(path, "w", encoding="ascii", newline="\n") as f:
+        for line in header:
+            f.write(f"# {line}\n")
         for sid in chosen:
-            lat, lon = where[sid]
+            _, lat, lon = cands[sid]
             f.write(f"{sid}\t{lat:.4f}\t{lon:.4f}\n")
-    print(f"wrote {STATIONS} ({len(chosen)} stations)")
+    print(f"wrote {path} ({len(chosen)} stations)")
 
 
-def stations():
+def select(ghcn):
+    """One station per 10-degree box: the one with the longest TMAX, TMIN and
+    PRCP record covering 1991-2020 (ties by id)."""
+    cands = candidates(ghcn)
+    write_list(STATIONS, best_per_box(cands), cands, [
+        "GHCN-Daily stations for scripts/calibrate.py fit: one per 10-degree box,",
+        "the longest TMAX/TMIN/PRCP record covering 1991-2020.",
+    ])
+
+
+def holdout(ghcn):
+    """Stations the fit never sees, for scripts/validate.py: per 10-degree box,
+    the longest record among stations other than the fit's and at least
+    100 km from it."""
+    cands = candidates(ghcn)
+    fit_by_box = {box_of(lat, lon): (lat, lon) for _, lat, lon in stations()}
+
+    def keep(sid):
+        _, lat, lon = cands[sid]
+        f = fit_by_box.get(box_of(lat, lon))
+        return f is None or km(lat, lon, *f) >= 100.0
+
+    write_list(HOLDOUT, best_per_box(cands, keep), cands, [
+        "GHCN-Daily stations for scripts/validate.py, none used by the fit: per",
+        "10-degree box, the longest TMAX/TMIN/PRCP record covering 1991-2020",
+        "among stations at least 100 km from the box's fit station.",
+    ])
+
+
+def thunder_list(ghcn):
+    """US stations for the thunder fit: per 3-degree box, the longest
+    TMAX/TMIN/PRCP record covering 1991-2020 among stations reporting WT03
+    for 20 or more of those years, none on the fit or holdout lists or within
+    100 km of a holdout station."""
+    cands = candidates(ghcn)
+    wt03 = {}
+    with open(ghcn / "ghcnd-inventory.txt", encoding="ascii") as f:
+        for line in f:
+            sid, _, _, el, y0, y1 = line.split()
+            if el == "WT03":
+                wt03[sid] = min(int(y1), LAST) - max(int(y0), FIRST)
+    taken = {sid for sid, _, _ in stations()} | {sid for sid, _, _ in stations(HOLDOUT)}
+    held = [(lat, lon) for _, lat, lon in stations(HOLDOUT)]
+
+    def keep(sid):
+        _, lat, lon = cands[sid]
+        return (sid.startswith("US") and wt03.get(sid, 0) >= 20 and sid not in taken
+                and all(km(lat, lon, a, b) >= 100.0 for a, b in held))
+
+    best = {}
+    for sid, (length, lat, lon) in cands.items():
+        if keep(sid):
+            box = (math.floor(lat / 3), math.floor(lon / 3))
+            if box not in best or (length, sid) > best[box]:
+                best[box] = (length, sid)
+    write_list(THUNDER, sorted(v[1] for v in best.values()), cands, [
+        "GHCN-Daily US stations for the thunder fit of scripts/calibrate.py: per",
+        "3-degree box, the longest TMAX/TMIN/PRCP record covering 1991-2020 among",
+        "stations reporting WT03 for 20 or more of those years, away from the",
+        "holdout stations.",
+    ])
+
+
+def thunder_samples(ghcn, sid):
+    """(tmax, mm, thunder) for the wet days of one station, 1991-2020; empty
+    when it reports thunder on fewer than 100 days."""
+    path = ghcn / "by_station" / f"{sid}.csv.gz"
+    if not path.exists():
+        return []
+    data = read_station(path)
+    tx, pr, wt = data.get("TMAX", {}), data.get("PRCP", {}), data.get("WT03", {})
+    days = [d for d in pr if FIRST <= d // 10000 <= LAST and d in tx]
+    if sum(1 for d in days if d in wt) < 100:
+        return []
+    return [(tx[d] / 10.0, pr[d] / 10.0, 1.0 if d in wt else 0.0) for d in days if pr[d] >= WET]
+
+
+def stations(path=STATIONS):
     out = []
-    for line in STATIONS.read_text(encoding="ascii").splitlines():
+    for line in Path(path).read_text(encoding="ascii").splitlines():
         if line and not line.startswith("#"):
             sid, lat, lon = line.split("\t")
             out.append((sid, float(lat), float(lon)))
@@ -95,10 +199,10 @@ def stations():
 # -- fetch -------------------------------------------------------------------
 
 
-def fetch(ghcn):
+def fetch(ghcn, path=STATIONS):
     d = ghcn / "by_station"
     d.mkdir(exist_ok=True)
-    for sid, _, _ in stations():
+    for sid, _, _ in stations(path):
         path = d / f"{sid}.csv.gz"
         if path.exists():
             continue
@@ -111,26 +215,32 @@ def fetch(ghcn):
 
 # -- fit ---------------------------------------------------------------------
 
-STEP = 1.0 / 6.0
+CLIMATE = HERE.parent / "resources" / "full" / "climate.tsv"
 
 
-def cru_cells(cru, wanted):
-    """{(row, col): {stem: [12 floats]}} for the 10' cells near the stations."""
-    out = defaultdict(dict)
-    for stem in ("tmp", "dtr", "rd0", "pre"):
-        with gzip.open(cru / f"grid_10min_{stem}.dat.gz", "rt", encoding="ascii") as f:
-            for line in f:
-                p = line.split()
-                key = (round((float(p[0]) + 90) / STEP - 0.5), round((float(p[1]) + 180) / STEP - 0.5))
-                if key in wanted:
-                    out[key][stem] = [float(x) for x in p[2:14]]
+def cru_cells(climate=CLIMATE, wanted=None):
+    """{(row, col) on the 0.5-degree grid: {stem: [12 floats]}} from the full
+    tier's climate table (stems as CRU's: tmp, dtr, rd0, pre)."""
+    out = {}
+    with open(climate, encoding="utf-8") as f:
+        header = f.readline().rstrip("\n").split("\t")
+        col = {name: k for k, name in enumerate(header)}
+        for line in f:
+            p = line.rstrip("\n").split("\t")
+            lat, lon = (float(x) for x in p[col["key"]].split(","))
+            key = (int((lat + 90.0) * 2), int((lon + 180.0) * 2))
+            if wanted is not None and key not in wanted:
+                continue
+            out[key] = {stem: [float(x) for x in p[col[name]].split(";")]
+                        for stem, name in (("tmp", "tmean"), ("dtr", "dtr"), ("rd0", "wet_days"), ("pre", "precipitation"))}
     return out
 
 
-def near(lat, lon, radius=3):
-    i0, j0 = round((lat + 90) / STEP - 0.5), round((lon + 180) / STEP - 0.5)
+def near(lat, lon, radius=1):
+    """0.5-degree cells around a point, nearest first."""
+    i0, j0 = int((lat + 90.0) * 2), int((lon + 180.0) * 2)
     cells = [(i0 + di, j0 + dj) for di in range(-radius, radius + 1) for dj in range(-radius, radius + 1)]
-    return sorted(cells, key=lambda c: (c[0] - i0) ** 2 + (c[1] - j0) ** 2)
+    return sorted(cells, key=lambda c: (c[0] + 0.5 - (lat + 90.0) * 2) ** 2 + (c[1] + 0.5 - (lon + 180.0) * 2) ** 2)
 
 
 def read_station(path):
@@ -199,10 +309,10 @@ def ols(x, y, names, label):
     return coef
 
 
-def fit(ghcn, cru):
+def fit(ghcn, climate):
     st = stations()
     wanted = {c for _, lat, lon in st for c in near(lat, lon)}
-    grid = cru_cells(cru, wanted)
+    grid = cru_cells(climate, wanted)
 
     occ, amt, offs, sds, spells = [], [], [], [], []
     m0, m1, npairs = np.zeros((2, 2)), np.zeros((2, 2)), 0
@@ -219,7 +329,7 @@ def fit(ghcn, cru):
             continue
         data = read_station(path)
 
-        # Daily arrays over 1961-1990 (NaN where missing).
+        # Daily arrays over 1991-2020 (NaN where missing).
         start = ordinal(FIRST * 10000 + 101)
         n = ordinal(LAST * 10000 + 1231) - start + 1
         arr = {}
@@ -384,6 +494,9 @@ def fit(ghcn, cru):
         print(f"  logistic: logit p = {w[0]:+.4f} {w[1]:+.4f} * T; p = 0.5 at {-w[0] / w[1]:+.2f}")
 
     # Thunder.
+    extra = [x for sid, _, _ in stations(THUNDER) for x in thunder_samples(ghcn, sid)] if THUNDER.exists() else []
+    print(f"\nthunder: {len(thunder)} wet days at fit stations, {len(extra)} at thunder stations")
+    thunder += extra
     if thunder:
         th = np.array(thunder)
         print(f"\nthunder on wet days (n = {len(th)}, share {th[:, 2].mean():.3f}):")
@@ -399,16 +512,21 @@ def fit(ghcn, cru):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("command", choices=["select", "fetch", "fit"])
+    ap.add_argument("command", choices=["select", "holdout", "thunder", "fetch", "fit"])
     ap.add_argument("ghcn", type=Path)
-    ap.add_argument("cru", type=Path, nargs="?")
+    ap.add_argument("climate", type=Path, nargs="?", default=CLIMATE)
+    ap.add_argument("--list", type=Path, default=STATIONS, help="station list for fetch")
     args = ap.parse_args()
     if args.command == "select":
         select(args.ghcn)
+    elif args.command == "holdout":
+        holdout(args.ghcn)
+    elif args.command == "thunder":
+        thunder_list(args.ghcn)
     elif args.command == "fetch":
-        fetch(args.ghcn)
+        fetch(args.ghcn, args.list)
     else:
-        fit(args.ghcn, args.cru)
+        fit(args.ghcn, args.climate)
 
 
 if __name__ == "__main__":

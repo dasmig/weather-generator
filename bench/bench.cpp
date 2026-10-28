@@ -8,11 +8,11 @@ int main(int argc, char** argv)
     dasmig::bench::runner run{"weather-generator", argc, argv};
 
     run.load("load", [&] {
-        dasmig::wthg gen;
+        dasmig::wtg gen;
         return gen.load(run.tier());
     });
 
-    dasmig::wthg gen;
+    dasmig::wtg gen;
     if (!gen.load(run.tier())) return run.missing_tier();
 
     dasmig::weather_request paris;
@@ -27,8 +27,17 @@ int main(int argc, char** argv)
     run.calls("get_weather_series 365 days", [&](std::uint64_t seed) {
         return gen.get_weather_series(paris, 365, seed);
     });
+    // Points on land (a point at sea throws): drawn places, moved within
+    // their cells.
+    std::vector<std::pair<double, double>> land;
+    for (std::uint64_t s = 0; s < 1024; ++s)
+    {
+        const auto w = gen.get_weather({}, s);
+        land.emplace_back(w.latitude + (static_cast<double>(s % 7) * 0.05), w.longitude + (static_cast<double>(s % 5) * 0.05));
+    }
     run.calls("climate_at", [&](std::uint64_t seed) {
-        return gen.climate_at(static_cast<double>(seed % 140) - 60.0, static_cast<double>(seed % 360) - 180.0);
+        const auto [lat, lon] = land[seed % land.size()];
+        return gen.climate_at(lat, lon);
     });
 
     run.batches("get_weather_batch", [&](std::size_t count, std::size_t threads, std::uint64_t seed) {

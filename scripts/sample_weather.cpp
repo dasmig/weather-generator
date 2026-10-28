@@ -1,4 +1,4 @@
-// Generates 1961-1990 at each station of a list, for scripts/validate.py.
+// Generates 1991-2020 at each station of a list, for scripts/validate.py.
 //
 // Usage: sample_weather TIER STATIONS OUT
 //   TIER      lite or full
@@ -22,7 +22,7 @@ int main(int argc, char** argv)
         std::cerr << "usage: sample_weather TIER STATIONS OUT\n";
         return 2;
     }
-    dasmig::wthg gen;
+    dasmig::wtg gen;
     if (!gen.load(std::string_view{argv[1]} == "full" ? dasmig::dataset::full : dasmig::dataset::lite))
     {
         std::cerr << "no data\n";
@@ -44,11 +44,21 @@ int main(int argc, char** argv)
         r.latitude = lat;
         r.longitude = lon;
         if (elev > -500.0) r.elevation = elev;
-        r.date = std::chrono::year{1961} / 1 / 1;
-        const auto days = static_cast<int>((std::chrono::sys_days{std::chrono::year{1991} / 1 / 1} -
+        r.date = std::chrono::year{1991} / 1 / 1;
+        const auto days = static_cast<int>((std::chrono::sys_days{std::chrono::year{2021} / 1 / 1} -
                                             std::chrono::sys_days{r.date})
                                                .count());
-        for (const auto& w : gen.get_weather_series(r, days, seed++))
+        std::vector<dasmig::weather> series;
+        try
+        {
+            series = gen.get_weather_series(r, days, seed++);
+        }
+        catch (const std::invalid_argument& e)
+        {
+            std::cerr << id << ": " << e.what() << '\n';
+            continue;
+        }
+        for (const auto& w : series)
         {
             out << id << '\t' << w.date_string() << '\t' << w.tmax << '\t' << w.tmin << '\t' << w.precipitation
                 << '\t' << dasmig::to_string(w.type) << '\t' << (w.thunder ? 1 : 0) << '\t' << w.cloud_cover << '\t'

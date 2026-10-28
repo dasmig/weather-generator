@@ -8,7 +8,7 @@ int main()
     using namespace std::chrono_literals;
 
     // The singleton loads the lite tier (compiled in, or from resources/).
-    auto& gen = dasmig::wthg::instance();
+    auto& gen = dasmig::wtg::instance();
     if (!gen.has_data())
     {
         std::cerr << "Could not load the weather data.\n";
