@@ -36,7 +36,7 @@
 /// @see See doc/usage.md for the narrative tutorial and doc/data.md for the
 ///      data and the model.
 
-DASMIG_CORE_REQUIRE(1, 1);
+DASMIG_CORE_REQUIRE(1, 3);
 
 namespace dasmig
 {
@@ -947,95 +947,17 @@ class wtg
         }
     }
 
-    static double fma_free_(double a, double b, double c) { return core::math::fenced(a * b) + c; }
-
-    // sin and cos of an angle in degrees, from + - * only, so the bits are
-    // the same everywhere (std::sin and std::cos are not correctly rounded).
-    static std::pair<double, double> sin_cos_deg_(double degrees)
-    {
-        const double q = std::round(degrees / 90.0);
-        const double x = (degrees - (90.0 * q)) * (std::numbers::pi / 180.0); // |x| <= pi/4
-        const double x2 = x * x;
-        // Taylor series to x^17 and x^16; the error is below 1e-17 on |x| <= pi/4.
-        double s = 1.0 / 355687428096000.0;
-        double c = 1.0 / 20922789888000.0;
-        constexpr std::array<double, 8> sin_terms{-1.0 / 1307674368000.0, 1.0 / 6227020800.0,
-                                                  -1.0 / 39916800.0,      1.0 / 362880.0,
-                                                  -1.0 / 5040.0,          1.0 / 120.0,
-                                                  -1.0 / 6.0,             1.0};
-        constexpr std::array<double, 8> cos_terms{-1.0 / 87178291200.0, 1.0 / 479001600.0,
-                                                  -1.0 / 3628800.0,     1.0 / 40320.0,
-                                                  -1.0 / 720.0,         1.0 / 24.0,
-                                                  -1.0 / 2.0,           1.0};
-        for (const double term : sin_terms) s = fma_free_(s, x2, term);
-        for (const double term : cos_terms) c = fma_free_(c, x2, term);
-        s *= x;
-        const int quadrant = ((static_cast<int>(q) % 4) + 4) % 4;
-        switch (quadrant)
-        {
-        case 1: return {c, -s};
-        case 2: return {-s, -c};
-        case 3: return {-c, s};
-        default: return {s, c};
-        }
-    }
-
-    static double sin_deg_(double degrees) { return sin_cos_deg_(degrees).first; }
-    static double cos_deg_(double degrees) { return sin_cos_deg_(degrees).second; }
-
-    // atan from + - * / only, for the same reason: odd Taylor series on
-    // |x| <= tan(pi / 8) after two reductions (error below 1e-17).
-    static double atan_(double x)
-    {
-        const bool negative = x < 0.0;
-        if (negative) x = -x;
-        const bool inverted = x > 1.0;
-        if (inverted) x = 1.0 / x;
-        double base = 0.0;
-        if (x > 0.41421356237309503) // tan(pi / 8)
-        {
-            x = (x - 1.0) / (x + 1.0);
-            base = std::numbers::pi / 4.0;
-        }
-        const double x2 = core::math::fenced(x * x);
-        double sum = 0.0;
-        for (int n = 25; n >= 0; --n) sum = fma_free_(sum, x2, (n % 2 == 0 ? 1.0 : -1.0) / ((2.0 * n) + 1.0));
-        double r = base + core::math::fenced(sum * x);
-        if (inverted) r = (std::numbers::pi / 2.0) - r;
-        return negative ? -r : r;
-    }
-
-    // atan2, asin and acos in degrees.
-    static double atan2_deg_(double y, double x)
-    {
-        constexpr double deg = 180.0 / std::numbers::pi;
-        if (x > 0.0) return atan_(y / x) * deg;
-        if (x < 0.0) return (atan_(y / x) * deg) + (y >= 0.0 ? 180.0 : -180.0);
-        if (y == 0.0) return 0.0;
-        return y > 0.0 ? 90.0 : -90.0;
-    }
-
-    static double asin_deg_(double x)
-    {
-        return atan2_deg_(x, std::sqrt(std::max(0.0, 1.0 - core::math::fenced(x * x))));
-    }
-
-    static double acos_deg_(double x)
-    {
-        return atan2_deg_(std::sqrt(std::max(0.0, 1.0 - core::math::fenced(x * x))), x);
-    }
-
     // Great-circle distance in km between two unit vectors.
     static double km_(const std::array<double, 3>& a, const std::array<double, 3>& b)
     {
         constexpr double rad = std::numbers::pi / 180.0;
-        return 2.0 * earth_radius_km * asin_deg_(std::min(1.0, std::sqrt(distance2_(a, b)) / 2.0)) * rad;
+        return 2.0 * earth_radius_km * core::math::asin_deg(std::min(1.0, std::sqrt(distance2_(a, b)) / 2.0)) * rad;
     }
 
     static std::array<double, 3> unit_vector_(double latitude, double longitude)
     {
-        const auto [slat, clat] = sin_cos_deg_(latitude);
-        const auto [slon, clon] = sin_cos_deg_(longitude);
+        const auto [slat, clat] = core::math::sin_cos_deg(latitude);
+        const auto [slon, clon] = core::math::sin_cos_deg(longitude);
         return {clat * clon, clat * slon, slat};
     }
 
@@ -1256,11 +1178,14 @@ class wtg
         const double f = std::clamp(lerp(c.wet), 0.0, 1.0);
         const double odds = factor(sf, sf * sf * (1.0 - (2.0 * f)));
 
+        const double wet_odds = core::math::fenced(f * odds);
+
         day_params p{};
         p.tmean = lerp(c.tmean);
         p.dtr = std::max(lerp(c.dtr), 0.0);
-        p.wet = std::min((f * odds) / ((f * odds) + (1.0 - f)), 0.995);
-        p.amount = std::max(lerp(c.amount) * factor(sa, (sa * sa) + (2.0 * sf * sa * (1.0 - f))), 0.1);
+        p.wet = std::min(wet_odds / (wet_odds + (1.0 - f)), 0.995);
+        p.amount =
+            std::max(lerp(c.amount) * factor(sa, (sa * sa) + core::math::fenced(2.0 * sf * sa * (1.0 - f))), 0.1);
         p.humidity = std::clamp(lerp(c.humidity), 1.0, 100.0);
         p.cloud = std::clamp(lerp(c.cloud), 0.0, 1.0);
         p.wind = std::max(lerp(c.wind), 0.0);
@@ -1280,40 +1205,6 @@ class wtg
         const double d = persistence_(f);
         const double p01 = core::math::fenced(f * (1.0 - d));
         return {p01, p01 + d};
-    }
-
-    // Marsaglia and Tsang (2000) for a gamma variate; a shape below 1 uses the
-    // shape + 1 variate times u^(1 / shape).
-    static double gamma_(core::rng& r, double shape, double scale) // NOLINT(bugprone-easily-swappable-parameters)
-    {
-        double boost = 1.0;
-        if (shape < 1.0)
-        {
-            const double u = 1.0 - core::uniform01(r); // (0, 1]
-            boost = core::math::exp(core::math::log(u) / shape);
-            shape += 1.0;
-        }
-        const double d = shape - (1.0 / 3.0);
-        const double c = 1.0 / std::sqrt(9.0 * d);
-        for (;;)
-        {
-            const double x = core::normal(r, 0.0, 1.0);
-            const double t = 1.0 + core::math::fenced(c * x);
-            if (t <= 0.0) continue;
-            const double v = t * t * t;
-            const double u = core::uniform01(r);
-            if (u <= 0.0) continue;
-            const double bound = core::math::fenced(0.5 * x * x) + d - core::math::fenced(d * v) +
-                                 core::math::fenced(d * core::math::log(v));
-            if (core::math::log(u) < bound) return d * v * scale * boost;
-        }
-    }
-
-    static double beta_(core::rng& r, double mean, double kappa)
-    {
-        const double x = gamma_(r, mean * kappa, 1.0);
-        const double y = gamma_(r, (1.0 - mean) * kappa, 1.0);
-        return x / (x + y);
     }
 
     static double logistic_(double z) { return 1.0 / (1.0 + core::math::exp(-z)); }
@@ -1373,28 +1264,28 @@ class wtg
         const double l0 = reduce(280.46646 + fenced(t * (36000.76983 + fenced(t * 0.0003032))));
         const double m = reduce(357.52911 + fenced(t * (35999.05029 - fenced(0.0001537 * t))));
         const double e = 0.016708634 - fenced(t * (0.000042037 + fenced(0.0000001267 * t)));
-        const double c = fenced(sin_deg_(m) * (1.914602 - fenced(t * (0.004817 + fenced(0.000014 * t))))) +
-                         fenced(sin_deg_(2.0 * m) * (0.019993 - fenced(0.000101 * t))) +
-                         fenced(sin_deg_(3.0 * m) * 0.000289);
+        const double c = fenced(core::math::sin_deg(m) * (1.914602 - fenced(t * (0.004817 + fenced(0.000014 * t))))) +
+                         fenced(core::math::sin_deg(2.0 * m) * (0.019993 - fenced(0.000101 * t))) +
+                         fenced(core::math::sin_deg(3.0 * m) * 0.000289);
         const double omega = reduce(125.04 - fenced(1934.136 * t));
-        const double lambda = l0 + c - 0.00569 - fenced(0.00478 * sin_deg_(omega));
+        const double lambda = l0 + c - 0.00569 - fenced(0.00478 * core::math::sin_deg(omega));
         const double eps0 =
             23.0 + ((26.0 + ((21.448 - fenced(t * (46.815 + fenced(t * (0.00059 - fenced(t * 0.001813)))))) / 60.0)) /
                     60.0);
-        const double eps = eps0 + fenced(0.00256 * cos_deg_(omega));
-        const double decl = asin_deg_(fenced(sin_deg_(eps) * sin_deg_(lambda)));
-        const double ty = sin_deg_(eps / 2.0) / cos_deg_(eps / 2.0);
+        const double eps = eps0 + fenced(0.00256 * core::math::cos_deg(omega));
+        const double decl = core::math::asin_deg(fenced(core::math::sin_deg(eps) * core::math::sin_deg(lambda)));
+        const double ty = core::math::sin_deg(eps / 2.0) / core::math::cos_deg(eps / 2.0);
         const double y = fenced(ty * ty);
         constexpr double deg = 180.0 / std::numbers::pi;
         const double eq_time =
             4.0 * deg *
-            (fenced(y * sin_deg_(2.0 * l0)) - fenced(2.0 * e * sin_deg_(m)) +
-             fenced(4.0 * e * y * sin_deg_(m) * cos_deg_(2.0 * l0)) - fenced(0.5 * y * y * sin_deg_(4.0 * l0)) -
-             fenced(1.25 * e * e * sin_deg_(2.0 * m)));
+            (fenced(y * core::math::sin_deg(2.0 * l0)) - fenced(2.0 * e * core::math::sin_deg(m)) +
+             fenced(4.0 * e * y * core::math::sin_deg(m) * core::math::cos_deg(2.0 * l0)) - fenced(0.5 * y * y * core::math::sin_deg(4.0 * l0)) -
+             fenced(1.25 * e * e * core::math::sin_deg(2.0 * m)));
         const double noon = 720.0 - fenced(4.0 * longitude) - eq_time;
 
-        const double denominator = fenced(cos_deg_(latitude) * cos_deg_(decl));
-        const double numerator = cos_deg_(90.833) - fenced(sin_deg_(latitude) * sin_deg_(decl));
+        const double denominator = fenced(core::math::cos_deg(latitude) * core::math::cos_deg(decl));
+        const double numerator = core::math::cos_deg(90.833) - fenced(core::math::sin_deg(latitude) * core::math::sin_deg(decl));
         // cos(hour angle) = numerator / denominator: above 1 the sun never
         // rises, below -1 it never sets.
         if (std::abs(denominator) < 1e-12 || numerator >= denominator || numerator <= -denominator)
@@ -1402,7 +1293,7 @@ class wtg
             const bool polar_day = (latitude > 0.0) == (decl > 0.0);
             return {.daylight_minutes = polar_day ? 1440.0 : 0.0, .rise = std::nullopt, .set = std::nullopt};
         }
-        const double hour_angle = acos_deg_(numerator / denominator);
+        const double hour_angle = core::math::acos_deg(numerator / denominator);
         return {.daylight_minutes = 8.0 * hour_angle, .rise = noon - (4.0 * hour_angle), .set = noon + (4.0 * hour_angle)};
     }
 
@@ -1471,7 +1362,7 @@ class wtg
             // Columns that can lie within the limit at this row's widest
             // latitude, plus one for the cell's own width.
             const double widest = std::max(std::abs(south), std::abs(north));
-            const double km_per_degree = std::max(1e-6, cos_deg_(std::min(widest, 89.999)) * 111.19);
+            const double km_per_degree = std::max(1e-6, core::math::cos_deg(std::min(widest, 89.999)) * 111.19);
             const int reach = std::min(land_columns / 2, static_cast<int>(sea_limit_km / km_per_degree * 2.0) + 2);
             for (int dj = -reach; dj <= reach; ++dj)
             {
@@ -1604,7 +1495,7 @@ class wtg
         auto r = day.split("amount");
         const double shape = std::clamp(model::shape0 + core::math::fenced(model::shape1 * core::math::log(p.amount)),
                                         model::shape_min, model::shape_max);
-        const double amount = std::max(gamma_(r, shape, p.amount / shape), 0.1);
+        const double amount = std::max(core::gamma(r, shape, p.amount / shape), 0.1);
         auto phase = day.split("phase");
         const double snow = logistic_(model::snow0 + core::math::fenced(model::snow1 * t.mean));
         if (core::uniform01(phase) >= snow) w.type = precipitation_type::rain;
@@ -1636,22 +1527,19 @@ class wtg
             const double cd = f < 1.0 ? (cbar - core::math::fenced(f * cw)) / (1.0 - f) : cbar;
             const double mean = std::clamp(wet ? cw : cd, 0.02, 0.98);
             auto r = day.split("cloud");
-            w.cloud_cover = round_to_(beta_(r, mean, model::cloud_kappa), 100.0);
+            constexpr double kappa = model::cloud_kappa;
+            w.cloud_cover = round_to_(core::beta(r, mean * kappa, (1.0 - mean) * kappa), 100.0);
         }
         {
-            const double hw = model::humidity_wet * (1.0 - f);
-            const double hd = -(model::humidity_wet * f);
+            const double hw = core::math::fenced(model::humidity_wet * (1.0 - f));
+            const double hd = -core::math::fenced(model::humidity_wet * f);
             auto r = day.split("humidity");
             const double h = core::normal(r, p.humidity + (wet ? hw : hd), model::humidity_sd);
             w.humidity = round_to_(std::clamp(h, 5.0, 100.0), 1.0);
         }
         {
             auto r = day.split("wind");
-            const double scale = p.wind / model::wind_gamma;
-            const double u = 1.0 - core::uniform01(r); // (0, 1]
-            const double e = -core::math::log(u);
-            const double v = e > 0.0 ? scale * core::math::exp(core::math::log(e) / model::wind_shape) : 0.0;
-            w.wind = round_to_(v, 10.0);
+            w.wind = round_to_(core::weibull(r, model::wind_shape, p.wind / model::wind_gamma), 10.0);
         }
     }
 
